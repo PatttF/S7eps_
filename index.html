@@ -113,7 +113,7 @@
                     </select>
                 </div>
                 <div class="flex items-center space-x-3">
-                    <label for="tempo-slider" class="font-medium"BPM</label>
+                    <label for="tempo-slider" class="font-medium">BPM</label>
                     <input type="range" id="tempo-slider" min="60" max="240" value="120" class="w-24 sm:w-32">
                     <span id="tempo-display" class="font-mono bg-gray-700 px-2 py-1 rounded-md text-sm">120</span>
                 </div>
@@ -151,6 +151,8 @@
         let midiInputs = [], midiOutputs = [];
         let armedTrackIndex = -1, selectedTrackIndex = 0, activeTrackIndexForModal = -1, activeStepForModal = null, tracks = [], soloedTrackIndex = -1;
         let nonPlayStepIndices = [];
+        let lastPressedNote = null;
+        let listenersInitialized = false;
 
         // MIDI Clock state
         let currentClockSourceId = 'internal';
@@ -210,7 +212,15 @@
             const phaser = new Tone.Phaser({ wet: 0, frequency: 0.5, octaves: 3, baseFrequency: 350 }).connect(delay);
             const source = createSynth().connect(phaser);
             
-            return { name: `Track ${index + 1}`, source, type: 'Synth', algorithm: 'VA', channel, reverb, delay, phaser, midiInPortId: "none", midiOutPortId: "none", midiInChan: "all", midiOutChan: 1, muteInternal: false, isMuted: false };
+            return { 
+                name: `Track ${index + 1}`, 
+                source, 
+                type: 'Synth', 
+                algorithm: 'VA', 
+                channel, reverb, delay, phaser,
+                midiInPortId: "none", midiOutPortId: "none", midiInChan: "all", midiOutChan: 1, 
+                muteInternal: false, isMuted: false,
+            };
         }
         
         // --- STABLE UI RENDERING ENGINE ---
@@ -221,7 +231,6 @@
                 renderGrid();
                 renderNoteInputGrid();
                 renderMidiSettings();
-                attachGlobalEventListeners();
             } catch (error) {
                 console.error("A critical error occurred during rendering:", error);
                 document.body.innerHTML = `<div class="p-8 text-red-500 bg-red-100">A fatal error occurred. Please check the developer console for details.</div>`;
@@ -238,14 +247,16 @@
                             <div class="flex items-center"><label class="w-20">Volume</label><input type="range" id="track-volume" min="-40" max="6" step="0.1" class="w-full"></div>
                             <div class="flex items-center"><label class="w-20">Pan</label><input type="range" id="track-pan" min="-1" max="1" step="0.01" class="w-full"></div>
                             <div class="flex items-center"><label class="w-28">Mute Internal</label><button id="mute-internal-btn" class="toggle-btn"></button></div>
-                            <div id="sampler-controls-mixer"></div>
                         </div>
                         <div class="space-y-2 p-3 bg-gray-700/50 rounded-lg"><h3 class="font-semibold">Effects</h3>
                              <div class="flex items-center"><label class="w-16">Reverb</label><input type="range" id="track-reverb" min="0" max="1" step="0.01" class="w-full"></div>
                             <div class="flex items-center"><label class="w-16">Delay</label><input type="range" id="track-delay" min="0" max="1" step="0.01" class="w-full"></div>
                             <div class="flex items-center"><label class="w-16">Phaser</label><input type="range" id="track-phaser" min="0" max="1" step="0.01" class="w-full"></div>
                         </div>
-                        <div id="synth-controls-container" class="space-y-2 p-3 bg-gray-700/50 rounded-lg"><h3 class="font-semibold">Synth Parameters</h3><div id="synth-controls-content"></div></div>
+                        <div id="instrument-params-container" class="space-y-2 p-3 bg-gray-700/50 rounded-lg">
+                            <h3 id="instrument-params-title" class="font-semibold"></h3>
+                            <div id="instrument-params-content"></div>
+                        </div>
                         <div class="text-right"><button class="close-modal-btn bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg">Close</button></div>
                     </div>
                 </div>
@@ -374,9 +385,6 @@
                     const btn = document.createElement('button');
                     btn.className = `note-input-btn rounded-md text-xs font-mono h-full ${isSharp ? 'sharp col-start-auto' : 'col-span-1'}`;
                     btn.dataset.note = noteName;
-                    btn.addEventListener('mousedown', (e) => { e.preventDefault(); handleNoteOn(btn.dataset.note); });
-                    btn.addEventListener('mouseup', () => handleNoteOff(btn.dataset.note));
-                    btn.addEventListener('mouseleave', () => handleNoteOff(btn.dataset.note));
                     noteInputGridContainer.appendChild(btn);
                 }
             }
@@ -406,14 +414,15 @@
             const wasSelected = selectedTrackIndex === tracks.length - 1;
 
             const removedTrack = tracks.pop();
-            if(removedTrack.source) removedTrack.source.dispose(); if(removedTrack.channel) removedTrack.channel.dispose();
+            if(removedTrack.source) removedTrack.source.dispose(); 
+            if(removedTrack.channel) removedTrack.channel.dispose();
             stepGrid.pop();
             nonPlayStepIndices.pop();
 
             if (wasArmed) armedTrackIndex = -1;
             if (wasSelected) selectTrack(selectedTrackIndex - 1);
             if (soloedTrackIndex === tracks.length) {
-                soloedTrackIndex = -1; // Clear solo if the soloed track was removed
+                soloedTrackIndex = -1;
             }
             
             renderAll();
@@ -421,27 +430,36 @@
         function loadSample(event, trackIndex) {
             const file = event.target.files[0]; if (!file) return;
             const url = URL.createObjectURL(file);
-            const sampler = new Tone.Sampler({ urls: { C4: url }, onload: () => {
-                if (tracks[trackIndex].source) tracks[trackIndex].source.dispose();
-                tracks[trackIndex].source = sampler.connect(tracks[trackIndex].phaser);
-                tracks[trackIndex].name = file.name.replace(/\.[^/.]+$/, "");
-                updateTrackTypeUI(trackIndex, 'Sampler');
-                renderAll();
-                URL.revokeObjectURL(url);
-            }});
+            const sampler = new Tone.Sampler({ 
+                urls: { C4: url },
+                attack: 0.01,
+                release: 0.1,
+                onload: () => {
+                    if (tracks[trackIndex].source) tracks[trackIndex].source.dispose();
+                    tracks[trackIndex].source = sampler.connect(tracks[trackIndex].phaser);
+                    tracks[trackIndex].name = file.name.replace(/\.[^/.]+$/, "");
+                    tracks[trackIndex].pitch = 0; // Add pitch property for samplers
+                    updateTrackTypeUI(trackIndex, 'Sampler');
+                    renderAll();
+                    URL.revokeObjectURL(url);
+                }
+            });
         }
         function clearSample(trackIndex) {
             if (tracks[trackIndex].type !== 'Sampler') return;
             if (tracks[trackIndex].source) tracks[trackIndex].source.dispose();
             tracks[trackIndex].source = createSynth().connect(tracks[trackIndex].phaser);
             tracks[trackIndex].name = `Track ${trackIndex + 1}`;
+            delete tracks[trackIndex].pitch; // remove pitch property
             updateTrackTypeUI(trackIndex, 'Synth');
             renderAll();
         }
         function updateTrackTypeUI(trackIndex, type) {
             tracks[trackIndex].type = type;
             const trackRow = document.getElementById(`track-row-${trackIndex}`);
-            if (trackRow) trackRow.querySelector('.clear-btn').style.display = type === 'Sampler' ? 'inline-block' : 'none';
+            if (trackRow) {
+                trackRow.querySelector('.clear-btn').style.display = type === 'Sampler' ? 'inline-block' : 'none';
+            }
         }
 
         // --- SEQUENCER & AUDIO LOGIC ---
@@ -450,71 +468,89 @@
             tracks.forEach((track, trackIndex) => {
                 const notesInStep = stepGrid[trackIndex]?.[step];
                 if (notesInStep && notesInStep.length > 0) {
-                    notesInStep.forEach(noteData => {
-                        const sixteenthDur = Tone.Time('16n').toSeconds();
-                        const ratchetCount = noteData.ratchet || 1;
-                        const velocity = noteData.velocity || 100;
-                        const offset = noteData.offset || 0;
+                    const sixteenthDur = Tone.Time('16n').toSeconds();
+                    const firstNoteData = notesInStep[0]; 
+                    const velocity = firstNoteData.velocity || 100;
+                    const offset = firstNoteData.offset || 0;
+                    const mainOffsetSec = sixteenthDur * (offset / 100);
 
-                        const ratchetDurSec = sixteenthDur / ratchetCount;
-                        const mainOffsetSec = sixteenthDur * (offset / 100);
-                        
-                        if (!track.muteInternal) {
-                            for(let i = 0; i < ratchetCount; i++) {
-                                const ratchetOffset = i * ratchetDurSec;
-                                const triggerTime = time + mainOffsetSec + ratchetOffset;
-                                track.source.triggerAttackRelease(noteData.note, Tone.Time(ratchetDurSec * 0.9), triggerTime, velocity / 127);
-                            }
+                    const ratchetCount = firstNoteData.ratchet || 1;
+                    const ratchetDurSec = sixteenthDur / ratchetCount;
+
+                    if (!track.muteInternal) {
+                        // For samplers, ensure monophonic playback by stopping previous notes.
+                        if (track.type === 'Sampler') {
+                           track.source.releaseAll(time);
                         }
 
-                        if (track.midiOutPortId !== 'none' && midiAccess) {
-                            const output = midiOutputs.find(o => o.id === track.midiOutPortId);
-                            if (output) {
+                        for (let i = 0; i < ratchetCount; i++) {
+                            const ratchetOffset = i * ratchetDurSec;
+                            const triggerTime = time + mainOffsetSec + ratchetOffset;
+                            const noteNames = notesInStep.map(n => n.note);
+                            const velNorm = velocity / 127;
+                            
+                            if (track.type === 'Sampler') {
+                                const pitchOffset = track.pitch || 0;
+                                const baseMidi = noteNameToMidi('C4'); // Samples are based on C4
+                                if (baseMidi !== null) {
+                                    const finalNote = midiToNoteName(baseMidi + pitchOffset);
+                                    track.source.triggerAttack(finalNote, triggerTime, velNorm);
+                                }
+                            } else {
+                                const duration = Tone.Time(ratchetDurSec * 0.9);
+                                track.source.triggerAttackRelease(noteNames, duration, triggerTime, velNorm);
+                            }
+                        }
+                    }
+
+                    // --- MIDI OUT LOGIC ---
+                    if (track.midiOutPortId !== 'none' && midiAccess) {
+                        const output = midiOutputs.find(o => o.id === track.midiOutPortId);
+                        if (output) {
+                            notesInStep.forEach(noteData => {
                                 const midiNote = noteNameToMidi(noteData.note);
                                 if (midiNote === null) return;
-                                
                                 const noteOnCmd = 0x90 + (parseInt(track.midiOutChan) - 1);
                                 const noteOffCmd = 0x80 + (parseInt(track.midiOutChan) - 1);
-                                
-                                for(let i = 0; i < ratchetCount; i++) {
-                                    const ratchetOffsetSec = i * ratchetDurSec;
-                                    const eventTime = time + mainOffsetSec + ratchetOffsetSec;
-                                    const durationSec = ratchetDurSec * 0.9;
-                                    
-                                    const delayMs = (eventTime - Tone.now()) * 1000;
-                                    const performanceOnTime = performance.now() + delayMs;
-                                    const performanceOffTime = performanceOnTime + (durationSec * 1000);
-
-                                    output.send([noteOnCmd, midiNote, velocity], performanceOnTime);
-                                    output.send([noteOffCmd, midiNote, 0], performanceOffTime);
-                                }
-                            }
+                                const onTime = performance.now() + ((time + mainOffsetSec) - Tone.now()) * 1000;
+                                const offTime = onTime + (sixteenthDur * 0.9 * 1000);
+                                output.send([noteOnCmd, midiNote, velocity], onTime);
+                                output.send([noteOffCmd, midiNote, 0], offTime);
+                            });
                         }
-                    });
+                    }
                 }
             });
-        }, Array.from({length: NUM_STEPS}, (_, i) => i), '16n').start(0);
+        }, Array.from({ length: NUM_STEPS }, (_, i) => i), '16n').start(0);
 
-        async function togglePlayback(forceState) { 
+        async function togglePlayback(forceState) {
             if (Tone.context.state !== 'running') await Tone.start();
-            
+
             const targetState = typeof forceState === 'boolean' ? forceState : !isPlaying;
 
-            if(targetState) { // Should be playing
+            if (targetState) {
                 Tone.Transport.start();
                 isPlaying = true;
                 playStopBtn.textContent = 'Stop';
-                playStopBtn.classList.add('bg-red-600'); playStopBtn.classList.remove('bg-blue-600');
+                playStopBtn.classList.add('bg-red-600');
+                playStopBtn.classList.remove('bg-blue-600');
                 document.querySelectorAll('.next-record-step').forEach(el => el.classList.remove('next-record-step'));
-            } else { // Should be stopped
-                Tone.Transport.stop(); 
+            } else { 
+                Tone.Transport.stop();
+                tracks.forEach(track => {
+                    if (track.source && typeof track.source.releaseAll === 'function') {
+                        track.source.releaseAll();
+                    }
+                });
                 isPlaying = false;
                 playStopBtn.textContent = 'Play';
-                playStopBtn.classList.add('bg-blue-600'); playStopBtn.classList.remove('bg-red-600');
-                updatePlayhead(-1); 
+                playStopBtn.classList.add('bg-blue-600');
+                playStopBtn.classList.remove('bg-red-600');
+                updatePlayhead(-1);
                 updateNextRecordStepVisual();
             }
         }
+
         function updatePlayhead(nextStep) {
             document.querySelectorAll(`[data-step="${currentStep}"]`).forEach(el => el.classList.remove('current'));
             if (nextStep > -1) document.querySelectorAll(`[data-step="${nextStep}"]`).forEach(el => el.classList.add('current'));
@@ -526,13 +562,13 @@
             selectedTrackIndex = trackIndex;
             renderGrid();
         }
-        
+
         function armTrack(trackIndex) {
             if (armedTrackIndex === trackIndex) {
                 armedTrackIndex = -1;
             } else {
                 armedTrackIndex = trackIndex;
-                if(selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
+                if (selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
             }
             renderGrid();
             updateNextRecordStepVisual();
@@ -546,26 +582,26 @@
 
         function toggleSolo(trackIndex) {
             if (soloedTrackIndex === trackIndex) {
-                soloedTrackIndex = -1; // Unsolo
+                soloedTrackIndex = -1; 
             } else {
-                soloedTrackIndex = trackIndex; // Solo this track
+                soloedTrackIndex = trackIndex; 
             }
             applyMuteAndSoloState();
             renderGrid();
         }
 
         function applyMuteAndSoloState() {
-            if (soloedTrackIndex === -1) { // No track is soloed, apply individual mutes
+            if (soloedTrackIndex === -1) {
                 tracks.forEach(track => {
                     track.channel.mute = track.isMuted;
                 });
-            } else { // A track is soloed
+            } else { 
                 tracks.forEach((track, index) => {
                     track.channel.mute = (index !== soloedTrackIndex);
                 });
             }
         }
-        
+
         function updateNextRecordStepVisual() {
             document.querySelectorAll('.next-record-step').forEach(el => el.classList.remove('next-record-step'));
             if (!isPlaying && armedTrackIndex > -1) {
@@ -578,38 +614,56 @@
         }
 
         function handleStepClick(event, trackIndex, stepIndex) {
+            if (event.ctrlKey || event.metaKey) {
+                clearStep(trackIndex, stepIndex);
+                return;
+            }
+            
             const track = tracks[trackIndex];
-            if (event.ctrlKey || event.metaKey) { clearStep(trackIndex, stepIndex); return; }
             if (track.type === 'Sampler') {
                 const stepHasNote = stepGrid[trackIndex][stepIndex].length > 0;
                 if (stepHasNote) clearStep(trackIndex, stepIndex);
-                else { recordNote(trackIndex, stepIndex, 'C4', 100, 0, 1); if (!track.channel.mute) track.source.triggerAttackRelease('C4', '8n'); }
-            } else if (track.type === 'Synth') { clearStep(trackIndex, stepIndex); }
+                else {
+                    recordNote(trackIndex, stepIndex, 'C4', 100, 0, 1);
+                    if (!track.channel.mute) {
+                        const pitchOffset = track.pitch || 0;
+                        const finalNote = midiToNoteName(noteNameToMidi('C4') + pitchOffset);
+                        track.source.triggerAttack(finalNote);
+                    }
+                }
+            } else if (track.type === 'Synth') {
+                 if (stepGrid[trackIndex][stepIndex].length === 0 && armedTrackIndex === trackIndex) {
+                    nonPlayStepIndices[armedTrackIndex] = stepIndex;
+                    updateNextRecordStepVisual();
+                 } else {
+                    clearStep(trackIndex, stepIndex);
+                 }
+            }
         }
 
         function handleNoteOn(note, velocity = 100) {
             const activeTrackForPlayback = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
-            
+
             if (activeTrackForPlayback > -1) {
                 const track = tracks[activeTrackForPlayback];
-                if(!track.muteInternal && !track.channel.mute) track.source.triggerAttack(note, Tone.now(), velocity / 127);
-                
+                if (!track.muteInternal && !track.channel.mute) track.source.triggerAttack(note, Tone.now(), velocity / 127);
+
                 if (armedTrackIndex > -1) {
                     if (isPlaying && currentStep > -1) {
                         recordNote(armedTrackIndex, currentStep, note, velocity, 0, 1);
                     } else if (!isPlaying) {
                         const recordStep = nonPlayStepIndices[armedTrackIndex];
-                        clearStep(armedTrackIndex, recordStep);
                         recordNote(armedTrackIndex, recordStep, note, velocity, 0, 1);
-                        nonPlayStepIndices[armedTrackIndex] = (recordStep + 1) % NUM_STEPS;
                         updateNextRecordStepVisual();
                     }
                 }
             }
             document.querySelector(`[data-note="${note}"]`)?.classList.add('pressed');
+            lastPressedNote = note;
         }
 
         function handleNoteOff(note) {
+            if (!note) return;
             const activeTrackForPlayback = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
             if (activeTrackForPlayback > -1) {
                 const track = tracks[activeTrackForPlayback];
@@ -618,47 +672,50 @@
                 }
             }
             document.querySelector(`[data-note="${note}"]`)?.classList.remove('pressed');
+            if (lastPressedNote === note) {
+                lastPressedNote = null;
+            }
         }
+
         function recordNote(trackIndex, stepIndex, note, velocity, offset, ratchet) {
             const stepData = stepGrid[trackIndex][stepIndex];
             if (!stepData.some(n => n.note === note)) {
                 stepData.push({ note, velocity, offset, ratchet });
+                stepData.sort((a,b) => (noteNameToMidi(a.note) || 0) - (noteNameToMidi(b.note) || 0));
                 document.querySelector(`[data-track="${trackIndex}"][data-step="${stepIndex}"]`).classList.add('active');
             }
         }
+
         function clearStep(trackIndex, stepIndex) {
             stepGrid[trackIndex][stepIndex] = [];
             document.querySelector(`[data-track="${trackIndex}"][data-step="${stepIndex}"]`).classList.remove('active');
         }
 
         // --- MIDI LOGIC ---
-        function initializeMidi() { 
+        function initializeMidi() {
             if (navigator.requestMIDIAccess) {
-                navigator.requestMIDIAccess({ sysex: true }).then(onMidiSuccess, e => console.error("MIDI Error:", e)); 
+                navigator.requestMIDIAccess({ sysex: true }).then(onMidiSuccess, e => console.error("MIDI Error:", e));
             }
         }
+
         function onMidiSuccess(access) {
             midiAccess = access;
-            // Update inputs/outputs lists
             midiInputs = Array.from(midiAccess.inputs.values());
             midiOutputs = Array.from(midiAccess.outputs.values());
-
-            // Update MIDI I/O settings modal
             renderMidiSettings();
-            
-            // Update clock source dropdown
+
             const oldClockVal = clockSourceSelect.value;
             while (clockSourceSelect.options.length > 1) { clockSourceSelect.remove(1); }
             midiInputs.forEach(input => {
                 const option = document.createElement('option');
-                option.value = input.id; option.textContent = input.name;
+                option.value = input.id;
+                option.textContent = input.name;
                 clockSourceSelect.appendChild(option);
             });
             if (Array.from(clockSourceSelect.options).some(o => o.value === oldClockVal)) {
                 clockSourceSelect.value = oldClockVal;
             }
 
-            // Set up listeners
             midiAccess.inputs.forEach(input => input.onmidimessage = onMidiMessage);
             access.onstatechange = () => initializeMidi();
         }
@@ -674,30 +731,24 @@
                 clockIntervals.length = 0;
             }
         }
-        
+
         function onMidiMessage(event) {
             const command = event.data[0];
-
-            // --- MIDI Clock Handling ---
             if (event.target.id === currentClockSourceId && currentClockSourceId !== 'internal') {
-                if (command === 250) { // START
-                    togglePlayback(true); return;
-                }
-                if (command === 252) { // STOP
-                    togglePlayback(false); return;
-                }
-                if (command === 248) { // CLOCK
+                if (command === 250) { togglePlayback(true); return; }
+                if (command === 252) { togglePlayback(false); return; }
+                if (command === 248) {
                     const now = performance.now();
                     if (lastClockTime > 0) {
                         const interval = now - lastClockTime;
                         clockIntervals.push(interval);
                         if (clockIntervals.length > CLOCK_INTERVAL_BUFFER_SIZE) { clockIntervals.shift(); }
                         const avgInterval = clockIntervals.reduce((a, b) => a + b, 0) / clockIntervals.length;
-                        const bpm = 60000 / (avgInterval * 24); // 24 pulses per quarter note
-                        
+                        const bpm = 60000 / (avgInterval * 24); 
+
                         if (isFinite(bpm)) {
-                             Tone.Transport.bpm.value = bpm;
-                             tempoDisplay.textContent = Math.round(bpm);
+                            Tone.Transport.bpm.value = bpm;
+                            tempoDisplay.textContent = Math.round(bpm);
                         }
                     }
                     lastClockTime = now;
@@ -705,20 +756,23 @@
                 }
             }
 
-            // --- MIDI Note Handling (if not a clock message) ---
             const [noteCommand, noteNumber, velocity] = event.data;
             const ch = (noteCommand & 0x0F) + 1;
             const activeTrackIndex = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
 
             if (activeTrackIndex > -1) {
                 const activeTrack = tracks[activeTrackIndex];
-                 if ((activeTrack.midiInPortId === 'none' || activeTrack.midiInPortId === event.target.id) && (activeTrack.midiInChan === 'all' || parseInt(activeTrack.midiInChan) === ch)) {
-                     if ((noteCommand & 0xF0) === 0x90 && velocity > 0) handleNoteOn(midiToNoteName(noteNumber), velocity);
-                     if ((noteCommand & 0xF0) === 0x80 || ((noteCommand & 0xF0) === 0x90 && velocity === 0)) handleNoteOff(midiToNoteName(noteNumber));
+                if ((activeTrack.midiInPortId === 'none' || activeTrack.midiInPortId === event.target.id) && (activeTrack.midiInChan === 'all' || parseInt(activeTrack.midiInChan) === ch)) {
+                    if ((noteCommand & 0xF0) === 0x90 && velocity > 0) handleNoteOn(midiToNoteName(noteNumber), velocity);
+                    if ((noteCommand & 0xF0) === 0x80 || ((noteCommand & 0xF0) === 0x90 && velocity === 0)) handleNoteOff(midiToNoteName(noteNumber));
                 }
             }
         }
-        function midiToNoteName(midi) { return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1); }
+
+        function midiToNoteName(midi) {
+            return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1);
+        }
+
         function noteNameToMidi(note) {
             const noteMap = { C: 0, "C#": 1, D: 2, "D#": 3, E: 4, F: 5, "F#": 6, G: 7, "G#": 8, A: 9, "A#": 10, B: 11 };
             const match = note.match(/([A-G]#?)(-?\d+)/);
@@ -726,7 +780,7 @@
             const [, name, octave] = match;
             return noteMap[name] + (parseInt(octave) + 1) * 12;
         }
-        
+
         // --- MODAL & CONTROLS ---
         function openTrackSettingsModal(trackIndex) {
             activeTrackIndexForModal = trackIndex;
@@ -742,20 +796,25 @@
             const muteBtn = modal.querySelector('#mute-internal-btn');
             muteBtn.textContent = track.muteInternal ? 'On' : 'Off';
             muteBtn.classList.toggle('active', track.muteInternal);
-            
-            const synthContainer = modal.querySelector('#synth-controls-container');
-            const samplerControls = modal.querySelector('#sampler-controls-mixer');
-            const synthContent = modal.querySelector('#synth-controls-content');
-            
+
+            const paramsTitle = modal.querySelector('#instrument-params-title');
+            const paramsContent = modal.querySelector('#instrument-params-content');
+            paramsContent.innerHTML = ''; // Clear previous content
+
             if (track.type === 'Sampler') {
-                synthContainer.style.display = 'none'; samplerControls.style.display = 'block';
-                samplerControls.innerHTML = `<div class="flex items-center"><label class="w-20">Reverse</label><button id="sampler-reverse-btn" class="toggle-btn ${track.source.reverse ? 'active' : ''}">Off</button></div>`;
-                samplerControls.querySelector('#sampler-reverse-btn').onclick = (e) => { track.source.reverse = !track.source.reverse; e.target.classList.toggle('active'); e.target.textContent = track.source.reverse ? 'On' : 'Off'; };
-            } else {
-                samplerControls.style.display = 'none'; synthContainer.style.display = 'block';
+                paramsTitle.textContent = 'Sampler Parameters';
+                const source = track.source;
+                const pitch = track.pitch || 0;
+                paramsContent.innerHTML = `
+                    <div class="flex items-center"><label class="w-28 text-sm">Pitch (Semi)</label><input type="range" id="sampler-pitch" value="${pitch}" min="-24" max="24" step="1" class="w-full instrument-control"><span id="sampler-pitch-display" class="ml-2 w-10 text-center text-xs">${pitch}</span></div>
+                    <div class="flex items-center"><label class="w-28 text-sm">Attack</label><input type="range" id="sampler-attack" value="${source.attack}" min="0" max="1" step="0.01" class="w-full instrument-control"></div>
+                    <div class="flex items-center"><label class="w-28 text-sm">Release</label><input type="range" id="sampler-release" value="${source.release}" min="0.01" max="4" step="0.01" class="w-full instrument-control"></div>
+                    <div class="flex items-center"><label class="w-28 text-sm">Reverse</label><button id="sampler-reverse-btn" class="toggle-btn ${source.reverse ? 'active' : ''}">${source.reverse ? 'On' : 'Off'}</button></div>
+                `;
+            } else { // 'Synth'
+                paramsTitle.textContent = 'Synth Parameters';
                 const algoOptions = Object.entries(SYNTH_ALGORITHMS).map(([key, name]) => `<option value="${key}" ${key === track.algorithm ? 'selected' : ''}>${name}</option>`).join('');
-                synthContent.innerHTML = `<div class="flex items-center"><label class="w-24 text-sm">Algorithm</label><select id="synth-algorithm" class="w-full bg-gray-600 rounded p-1">${algoOptions}</select></div><div id="dynamic-synth-params"></div>`;
-                synthContent.querySelector('#synth-algorithm').onchange = (e) => handleAlgorithmChange(e.target.value);
+                paramsContent.innerHTML = `<div class="flex items-center"><label class="w-24 text-sm">Algorithm</label><select id="synth-algorithm" class="w-full bg-gray-600 rounded p-1 instrument-control">${algoOptions}</select></div><div id="dynamic-synth-params"></div>`;
                 renderDynamicSynthParams(track);
             }
             modal.classList.remove('hidden');
@@ -764,36 +823,40 @@
         function handleAlgorithmChange(newAlgo) {
             if (activeTrackIndexForModal < 0) return;
             const track = tracks[activeTrackIndexForModal];
-            if(track.source) track.source.dispose();
+            if (track.source) track.source.dispose();
             track.source = createSynth(newAlgo).connect(track.phaser);
             track.algorithm = newAlgo;
             openTrackSettingsModal(activeTrackIndexForModal);
         }
-        
+
         function renderDynamicSynthParams(track) {
             const container = document.getElementById('dynamic-synth-params');
-            if(!container) return;
+            if (!container) return;
             container.innerHTML = '';
             const params = track.source.get();
-            
+
             const createSlider = (label, obj, prop, min, max, step) => {
-                const val = obj ? params[obj]?.[prop] ?? 0 : params[prop] ?? 0;
+                const val = obj ? params[obj] ?.[prop] ?? 0 : params[prop] ?? 0;
                 const dataAttrs = obj ? `data-param-object="${obj}"` : '';
-                return `<div class="flex items-center"><label class="w-28 text-sm">${label}</label><input type="range" ${dataAttrs} data-param="${prop}" value="${val}" min="${min}" max="${max}" step="${step}" class="w-full synth-control"></div>`;
+                return `<div class="flex items-center"><label class="w-28 text-sm">${label}</label><input type="range" ${dataAttrs} data-param="${prop}" value="${val}" min="${min}" max="${max}" step="${step}" class="w-full instrument-control"></div>`;
             }
 
             switch (track.algorithm) {
-                case 'VA': case 'Wavefolder':
+                case 'VA':
+                case 'Wavefolder':
                     const osc = params.oscillator || {};
                     const oscOptions = ['sine', 'square', 'sawtooth', 'triangle', 'fatsawtooth', 'pulse', 'pwm'].map(o => `<option value="${o}" ${o === osc.type ? 'selected' : ''}>${o}</option>`).join('');
-                    container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Oscillator</label><select data-param-object="oscillator" data-param="type" class="w-full bg-gray-600 rounded p-1 synth-control">${oscOptions}</select></div>`;
+                    container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Oscillator</label><select data-param-object="oscillator" data-param="type" class="w-full bg-gray-600 rounded p-1 instrument-control">${oscOptions}</select></div>`;
                     if (osc.type === 'pulse') container.innerHTML += createSlider('Pulse Width', 'oscillator', 'width', 0, 1, 0.01);
                     if (osc.type === 'pwm') container.innerHTML += createSlider('PWM Freq', 'oscillator', 'modulationFrequency', 0.1, 20, 0.1);
                     container.innerHTML += createSlider('Attack', 'envelope', 'attack', 0.001, 1, 0.001);
                     container.innerHTML += createSlider('Decay', 'envelope', 'decay', 0.01, 2, 0.01);
                     container.innerHTML += createSlider('Sustain', 'envelope', 'sustain', 0, 1, 0.01);
                     container.innerHTML += createSlider('Release', 'envelope', 'release', 0.01, 4, 0.01);
-                    if(track.algorithm === 'Wavefolder' && track.source._shaper) { const driveVal = Math.log10((track.source._shaper.curve?.length || 4) / 4); container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Drive</label><input type="range" data-param-type="shaper" data-param="drive" value="${driveVal}" min="0" max="3" step="0.1" class="w-full synth-control"></div>`; }
+                    if (track.algorithm === 'Wavefolder' && track.source._shaper) {
+                        const driveVal = Math.log10((track.source._shaper.curve?.length || 4) / 4);
+                        container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Drive</label><input type="range" data-param-type="shaper" data-param="drive" value="${driveVal}" min="0" max="3" step="0.1" class="w-full instrument-control"></div>`;
+                    }
                     break;
                 case 'FM':
                     container.innerHTML += createSlider('Harmonicity', null, 'harmonicity', 0.1, 20, 0.1);
@@ -818,27 +881,46 @@
 
         function handleTrackSettingsChange(e) {
             if (activeTrackIndexForModal < 0) return;
-            const track = tracks[activeTrackIndexForModal], el = e.target;
-            let val = el.type === 'range' ? parseFloat(el.value) : el.value;
+            const track = tracks[activeTrackIndexForModal];
+            const el = e.target;
+            const val = el.type === 'range' || el.type === 'select-one' ? el.value : null;
 
-            switch(el.id) {
-                case 'track-volume': track.channel.volume.value = val; return;
-                case 'track-pan': track.channel.pan.value = val; return;
-                case 'track-reverb': track.reverb.wet.value = val; return;
-                case 'track-delay': track.delay.wet.value = val; return;
-                case 'track-phaser': track.phaser.wet.value = val; return;
+            switch (el.id) {
+                case 'track-volume': track.channel.volume.value = parseFloat(val); return;
+                case 'track-pan': track.channel.pan.value = parseFloat(val); return;
+                case 'track-reverb': track.reverb.wet.value = parseFloat(val); return;
+                case 'track-delay': track.delay.wet.value = parseFloat(val); return;
+                case 'track-phaser': track.phaser.wet.value = parseFloat(val); return;
                 case 'mute-internal-btn': track.muteInternal = !track.muteInternal; el.textContent = track.muteInternal ? 'On' : 'Off'; el.classList.toggle('active', track.muteInternal); return;
+                
+                // Sampler Controls
+                case 'sampler-pitch':
+                    track.pitch = parseInt(val);
+                    document.getElementById('sampler-pitch-display').textContent = val;
+                    return;
+                case 'sampler-attack': track.source.attack = parseFloat(val); return;
+                case 'sampler-release': track.source.release = parseFloat(val); return;
+                case 'sampler-reverse-btn':
+                    track.source.reverse = !track.source.reverse;
+                    el.textContent = track.source.reverse ? 'On' : 'Off';
+                    el.classList.toggle('active', track.source.reverse);
+                    return;
+
+                // Synth Controls
+                case 'synth-algorithm': handleAlgorithmChange(val); return;
             }
-            if (el.classList.contains('synth-control')) {
+
+            if (el.classList.contains('instrument-control')) {
+                let paramValue = el.type === 'range' ? parseFloat(el.value) : el.value;
                 const { param, paramObject, paramType } = el.dataset;
                 let settings = {};
 
-                if (paramType === 'shaper') { // Special case for wavefolder drive
-                    if (track.source._shaper) track.source._shaper.curve = new Float32Array(4096).map((_,i) => Math.tanh( (i/2048-1) * (10 ** val) ));
-                } else if (paramObject) { // Nested objects like envelope, oscillator
-                    settings[paramObject] = { [param]: val };
-                } else { // Top-level properties like harmonicity, attackNoise
-                    settings[param] = val;
+                if (paramType === 'shaper') {
+                    if (track.source._shaper) track.source._shaper.curve = new Float32Array(4096).map((_, i) => Math.tanh((i / 2048 - 1) * (10 ** paramValue)));
+                } else if (paramObject) {
+                    settings[paramObject] = { [param]: paramValue };
+                } else {
+                    settings[param] = paramValue;
                 }
                 track.source.set(settings);
 
@@ -849,7 +931,7 @@
         }
 
         function openStepDetailModal(trackIndex, stepIndex) {
-            const stepData = stepGrid[trackIndex]?.[stepIndex];
+            const stepData = stepGrid[trackIndex] ?.[stepIndex];
             if (!stepData || stepData.length === 0) return;
             activeStepForModal = { track: trackIndex, step: stepIndex };
             const firstNote = stepData[0];
@@ -862,10 +944,11 @@
             modal.querySelector('#step-offset-display').textContent = firstNote.offset;
             modal.classList.remove('hidden');
         }
+
         function handleStepDetailChange() {
-             if (!activeStepForModal) return;
+            if (!activeStepForModal) return;
             const { track, step } = activeStepForModal;
-            const stepData = stepGrid[track]?.[step];
+            const stepData = stepGrid[track] ?.[step];
             if (!stepData || stepData.length === 0) return;
             const modal = document.getElementById('step-detail-modal');
             const newVelocity = parseInt(modal.querySelector('#step-velocity').value);
@@ -873,37 +956,29 @@
             const newRatchet = parseInt(modal.querySelector('#step-ratchet').value);
             modal.querySelector('#step-velocity-display').textContent = newVelocity;
             modal.querySelector('#step-offset-display').textContent = newOffset;
-            stepData.forEach(note => { note.velocity = newVelocity; note.offset = newOffset; note.ratchet = newRatchet; });
+            stepData.forEach(note => {
+                note.velocity = newVelocity;
+                note.offset = newOffset;
+                note.ratchet = newRatchet;
+            });
         }
 
         function renderMidiSettings() {
             const container = document.getElementById('midi-track-settings');
-            if(!container) return;
-
-            const header = `<div class="hidden md:grid grid-cols-5 gap-x-4 gap-y-2 text-sm font-bold text-gray-400 border-b border-gray-600 pb-2 mb-2">
-                <span>Track</span><span>Input Device</span><span>In Ch</span><span>Output Device</span><span>Out Ch</span>
-            </div>`;
-            
+            if (!container) return;
+            const header = `<div class="hidden md:grid grid-cols-5 gap-x-4 gap-y-2 text-sm font-bold text-gray-400 border-b border-gray-600 pb-2 mb-2"><span>Track</span><span>Input</span><span>In Ch</span><span>Output</span><span>Out Ch</span></div>`;
             const inputOptions = `<option value="none">None</option>` + midiInputs.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
             const outputOptions = `<option value="none">None</option>` + midiOutputs.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
-            const channels = Array.from({length: 16}, (_, i) => `<option value="${i+1}">${i+1}</option>`).join('');
-            
-            const trackRows = tracks.map((track, index) => {
-                return `
-                    <div class="grid grid-cols-1 md:grid-cols-5 gap-x-4 gap-y-2 items-center border-b border-gray-700 pb-2">
-                        <div class="font-medium text-gray-300 truncate"><span class="md:hidden font-bold">Track: </span>${track.name}</div>
-                        
-                        <div class="flex items-center"><span class="md:hidden w-24">Input: </span><select data-track-index="${index}" data-type="in-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${inputOptions}</select></div>
-                        <div class="flex items-center"><span class="md:hidden w-24">In Ch: </span><select data-track-index="${index}" data-type="in-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm"><option value="all">All</option>${channels}</select></div>
-                        <div class="flex items-center"><span class="md:hidden w-24">Output: </span><select data-track-index="${index}" data-type="out-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${outputOptions}</select></div>
-                        <div class="flex items-center"><span class="md:hidden w-24">Out Ch: </span><select data-track-index="${index}" data-type="out-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${channels}</select></div>
-                    </div>
-                `;
-            }).join('');
-
+            const channels = Array.from({ length: 16 }, (_, i) => `<option value="${i+1}">${i+1}</option>`).join('');
+            const trackRows = tracks.map((track, index) => `
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-x-4 gap-y-2 items-center border-b border-gray-700 py-2">
+                    <div class="font-medium text-gray-300 truncate"><span class="md:hidden font-bold">Track: </span>${track.name}</div>
+                    <select data-track-index="${index}" data-type="in-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${inputOptions}</select>
+                    <select data-track-index="${index}" data-type="in-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm"><option value="all">All</option>${channels}</select>
+                    <select data-track-index="${index}" data-type="out-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${outputOptions}</select>
+                    <select data-track-index="${index}" data-type="out-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${channels}</select>
+                </div>`).join('');
             container.innerHTML = header + trackRows;
-
-            // Re-apply the selected values after rendering
             tracks.forEach((track, index) => {
                 container.querySelector(`[data-track-index="${index}"][data-type="in-port"]`).value = track.midiInPortId;
                 container.querySelector(`[data-track-index="${index}"][data-type="in-chan"]`).value = track.midiInChan;
@@ -911,9 +986,11 @@
                 container.querySelector(`[data-track-index="${index}"][data-type="out-chan"]`).value = track.midiOutChan;
             });
         }
-        
+
         // --- EVENT LISTENERS ---
-        function attachGlobalEventListeners() {
+        function initializeEventListeners() {
+            if (listenersInitialized) return;
+
             playStopBtn.addEventListener('click', () => togglePlayback());
             tempoSlider.addEventListener('input', (e) => { 
                 if (currentClockSourceId === 'internal') {
@@ -923,47 +1000,65 @@
             });
             addTrackBtn.addEventListener('click', addTrack);
             removeTrackBtn.addEventListener('click', removeLastTrack);
-            
-            modalsContainer.addEventListener('click', (e) => { if (e.target.classList.contains('close-modal-btn')) e.target.closest('.modal').classList.add('hidden'); });
-            modalsContainer.addEventListener('input', (e) => {
-                const modal = e.target.closest('.modal'); if (!modal) return;
-                switch(modal.id) {
+            document.getElementById('midi-settings-btn').addEventListener('click', () => {
+                document.getElementById('midi-modal')?.classList.remove('hidden');
+            });
+
+            noteInputGridContainer.addEventListener('mousedown', e => {
+                if (e.target.matches('.note-input-btn')) {
+                    e.preventDefault();
+                    handleNoteOn(e.target.dataset.note);
+                }
+            });
+            window.addEventListener('mouseup', () => handleNoteOff(lastPressedNote));
+            window.addEventListener('mouseleave', () => handleNoteOff(lastPressedNote));
+
+            modalsContainer.addEventListener('click', e => {
+                const el = e.target;
+                if (el.matches('.close-modal-btn')) {
+                    el.closest('.modal').classList.add('hidden');
+                } else if (el.closest('#track-settings-modal') && el.matches('button')) {
+                    handleTrackSettingsChange(e);
+                }
+            });
+
+            modalsContainer.addEventListener('input', e => {
+                const modal = e.target.closest('.modal');
+                if (!modal) return;
+                switch (modal.id) {
                     case 'step-detail-modal': handleStepDetailChange(); break;
                     case 'track-settings-modal': handleTrackSettingsChange(e); break;
                 }
             });
+
+            modalsContainer.addEventListener('change', e => {
+                 if (e.target.matches('.midi-config-select')) {
+                    const { trackIndex, type } = e.target.dataset;
+                    const track = tracks[parseInt(trackIndex)];
+                    if(!track) return;
+                    switch (type) {
+                        case 'in-port': track.midiInPortId = e.target.value; break;
+                        case 'in-chan': track.midiInChan = e.target.value; break;
+                        case 'out-port': track.midiOutPortId = e.target.value; break;
+                        case 'out-chan': track.midiOutChan = e.target.value; break;
+                    }
+                }
+            });
             
-            const midiModalElement = document.getElementById('midi-modal');
-            if (midiModalElement) {
-                 document.getElementById('midi-settings-btn').onclick = () => { renderMidiSettings(); midiModalElement.classList.remove('hidden'); };
-                 const midiTrackSettings = midiModalElement.querySelector('#midi-track-settings');
-                 if(midiTrackSettings) {
-                    midiTrackSettings.addEventListener('change', (e) => {
-                        if (e.target.classList.contains('midi-config-select')) {
-                            const { trackIndex, type } = e.target.dataset;
-                            const track = tracks[parseInt(trackIndex)];
-                            switch(type) {
-                                case 'in-port': track.midiInPortId = e.target.value; break;
-                                case 'in-chan': track.midiInChan = e.target.value; break;
-                                case 'out-port': track.midiOutPortId = e.target.value; break;
-                                case 'out-chan': track.midiOutChan = e.target.value; break;
-                            }
-                        }
-                    });
-                 }
-            }
+            listenersInitialized = true;
         }
-        
+
         // --- STARTUP ---
         function main() {
             clockSourceSelect = document.getElementById('clock-source-select');
             clockSourceSelect.addEventListener('change', handleClockSourceChange);
-            for(let i = 0; i < 4; i++) { 
-                tracks.push(createNewTrack(i)); 
-                stepGrid.push(Array.from({length: NUM_STEPS}, () => []));
+            for (let i = 0; i < 4; i++) {
+                tracks.push(createNewTrack(i));
+                stepGrid.push(Array.from({ length: NUM_STEPS }, () => []));
                 nonPlayStepIndices.push(0);
             }
             renderAll();
+            initializeEventListeners();
             initializeMidi();
         }
 

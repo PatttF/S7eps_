@@ -120,6 +120,12 @@
                 <button id="play-stop-btn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg">Play</button>
             </div>
         </header>
+        
+        <div id="playhead-controls" class="flex-shrink-0 w-full flex justify-center items-center gap-4 py-1 hidden">
+             <button id="playhead-left-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&larr;</button>
+             <span class="text-xs text-gray-400">STEP RECORD</span>
+             <button id="playhead-right-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&rarr;</button>
+        </div>
 
         <div id="note-input-scroll-wrapper" class="flex-shrink-0 w-full overflow-x-auto bg-gray-700 rounded-lg p-2">
              <div id="note-input-grid" class="h-20 grid grid-rows-2 grid-flow-col gap-1" style="min-width: 105rem;"></div>
@@ -136,8 +142,8 @@
 
     <script type="module">
         // --- CONSTANTS ---
+        let NUM_STEPS = 16;
         const LARGE_SCREEN_BREAKPOINT = 1024;
-        let NUM_STEPS = window.innerWidth >= LARGE_SCREEN_BREAKPOINT ? 32 : 16;
         const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
         const NOTE_INPUT_OCTAVES = 7;
         const NOTE_INPUT_START_OCTAVE = 1;
@@ -161,6 +167,7 @@
             removeTrackBtn: document.getElementById('remove-track-btn'),
             midiSettingsBtn: document.getElementById('midi-settings-btn'),
             clockSourceSelect: document.getElementById('clock-source-select'),
+            playheadControls: document.getElementById('playhead-controls'),
         };
 
         // --- APPLICATION STATE ---
@@ -175,7 +182,7 @@
             soloedTrackIndex: -1,
             activeModalTrackIndex: -1,
             activeModalStep: null,
-            lastPressedNote: null,
+            liveNotes: new Set(),
             listenersInitialized: false,
             midi: {
                 access: null,
@@ -186,6 +193,19 @@
                 clockIntervals: [],
             }
         };
+        
+        // --- UTILITY FUNCTIONS ---
+        function midiToNoteName(midi) {
+            return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1);
+        }
+
+        function noteNameToMidi(note) {
+            const noteMap = { C: 0, "C#": 1, D: 2, "D#": 3, E: 4, F: 5, "F#": 6, G: 7, "G#": 8, A: 9, "A#": 10, B: 11 };
+            const match = note.match(/([A-G]#?)(-?\d+)/);
+            if (!match) return null;
+            const [, name, octave] = match;
+            return noteMap[name] + (parseInt(octave) + 1) * 12;
+        }
 
         // --- SYNTH PARAMETER DEFAULTS ---
         const getDefaultSynthParams = (type = 'VA') => {
@@ -304,24 +324,38 @@
                 trackDiv.id = `track-row-${trackIndex}`;
                 trackDiv.dataset.trackIndex = trackIndex;
 
-                const stepsContainer = document.createElement('div');
-                stepsContainer.className = 'grid gap-1.5';
-                const cols = NUM_STEPS === 32 ? 16 : 8;
-                stepsContainer.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-                if(NUM_STEPS === 32) stepsContainer.style.gridTemplateRows = 'repeat(2, minmax(0, 1fr))';
-
-
-                for(let stepIndex = 0; stepIndex < NUM_STEPS; stepIndex++) {
+                const mainContentDiv = document.createElement('div');
+                mainContentDiv.className = "flex flex-col gap-2";
+                
+                const isSelectedAndArmed = state.armedTrackIndex === trackIndex && !state.isPlaying;
+                
+                if (isSelectedAndArmed) {
+                    const playheadDiv = document.createElement('div');
+                    playheadDiv.className = 'flex justify-center items-center gap-4';
+                    playheadDiv.innerHTML = `
+                         <button class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg" data-action="playhead-left">&larr;</button>
+                         <span class="text-xs text-gray-400">STEP RECORD</span>
+                         <button class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg" data-action="playhead-right">&rarr;</button>
+                    `;
+                    mainContentDiv.appendChild(playheadDiv);
+                }
+                
+                const stepsWrapper = document.createElement('div');
+                stepsWrapper.className = 'grid grid-cols-8 grid-rows-2 gap-1.5';
+                
+                for (let stepIndex = 0; stepIndex < NUM_STEPS; stepIndex++) { 
                     const hasNotes = state.stepGrid[trackIndex]?.[stepIndex]?.length > 0;
                     const stepButton = document.createElement('button');
                     stepButton.className = `step h-10 w-full rounded-md ${(stepIndex % 4 === 0) ? 'accent' : ''} ${hasNotes ? 'active' : ''}`;
                     stepButton.dataset.step = stepIndex;
                     stepButton.dataset.action = "handle-step-click";
                     stepButton.dataset.dblaction = "open-step-detail";
-                    stepsContainer.appendChild(stepButton);
+                    stepsWrapper.appendChild(stepButton);
                 }
+                mainContentDiv.appendChild(stepsWrapper);
 
-                trackDiv.innerHTML = `
+                const infoPanelWrapper = document.createElement('div');
+                infoPanelWrapper.innerHTML = `
                     <div class="flex flex-col sm:flex-row items-center gap-2 flex-shrink-0 cursor-pointer" data-action="select-track">
                         <div class="w-24 font-semibold text-gray-400 truncate text-right" data-action="edit-track-name">${track.name}</div>
                         <div class="flex flex-col gap-1 w-28">
@@ -337,7 +371,9 @@
                         </div>
                     </div>
                 `;
-                trackDiv.appendChild(stepsContainer);
+                
+                trackDiv.appendChild(infoPanelWrapper.firstElementChild);
+                trackDiv.appendChild(mainContentDiv);
                 dom.gridContainer.appendChild(trackDiv);
             });
         }
@@ -441,8 +477,7 @@
                 state.armedTrackIndex = trackIndex;
                 if(state.selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
             }
-            if (prevArmed > -1) updateArmButtonUI(prevArmed);
-            updateArmButtonUI(trackIndex);
+            renderGrid(); // Re-render to show/hide playhead controls
             updateNextRecordStepVisual();
         }
 
@@ -496,6 +531,7 @@
         
         function handleNoteOn(note, velocity = 100) {
             const activeTrackForPlayback = (state.armedTrackIndex > -1) ? state.armedTrackIndex : state.selectedTrackIndex;
+            state.liveNotes.add(note);
 
             if (activeTrackForPlayback > -1) {
                 const track = state.tracks[activeTrackForPlayback];
@@ -515,7 +551,10 @@
                     } else if (!state.isPlaying) {
                         const recordStep = state.nonPlayStepIndices[state.armedTrackIndex];
                         recordNote(state.armedTrackIndex, recordStep, note, velocity, 0, 1);
-                        updateNextRecordStepVisual();
+                        if(state.liveNotes.size === 1) { // Advance only on the first note of a chord
+                            state.nonPlayStepIndices[state.armedTrackIndex] = (recordStep + 1) % NUM_STEPS;
+                            updateNextRecordStepVisual();
+                        }
                     }
                 }
             }
@@ -524,6 +563,7 @@
 
         function handleNoteOff(note) {
             if (!note) return;
+            state.liveNotes.delete(note);
             const activeTrackForPlayback = (state.armedTrackIndex > -1) ? state.armedTrackIndex : state.selectedTrackIndex;
             if (activeTrackForPlayback > -1) {
                 const track = state.tracks[activeTrackForPlayback];
@@ -549,6 +589,33 @@
         function clearStep(trackIndex, stepIndex) {
             state.stepGrid[trackIndex][stepIndex] = [];
             updateStepButtonUI(trackIndex, stepIndex);
+        }
+        
+        function loadSample(event, trackIndex) {
+            const file = event.target.files[0]; if (!file) return;
+            const url = URL.createObjectURL(file);
+            const sampler = new Tone.Sampler({ 
+                urls: { C4: url },
+                attack: 0.01,
+                release: 0.1,
+                onload: () => {
+                    if (state.tracks[trackIndex].source) state.tracks[trackIndex].source.dispose();
+                    state.tracks[trackIndex].source = sampler.connect(state.tracks[trackIndex].phaser);
+                    state.tracks[trackIndex].name = file.name.replace(/\.[^/.]+$/, "");
+                    state.tracks[trackIndex].type = 'Sampler';
+                    state.tracks[trackIndex].pitch = 0; // Add pitch property for samplers
+                    renderGrid(); // Re-render the grid to show new track name and clear button
+                    URL.revokeObjectURL(url);
+                }
+            });
+        }
+        function clearSample(trackIndex) {
+            if (state.tracks[trackIndex].type !== 'Sampler') return;
+            if (state.tracks[trackIndex].source) state.tracks[trackIndex].source.dispose();
+            state.tracks[trackIndex].source = createSynth().connect(state.tracks[trackIndex].phaser);
+            state.tracks[trackIndex].name = `Track ${trackIndex + 1}`;
+            delete state.tracks[trackIndex].pitch; // remove pitch property
+            renderGrid();
         }
 
         // --- SEQUENCER & AUDIO LOGIC ---
@@ -605,7 +672,7 @@
                     }
                 }
             });
-        }, Array.from({ length: 32 }, (_, i) => i), '16n').start(0);
+        }, Array.from({ length: NUM_STEPS }, (_, i) => i), '16n').start(0);
 
         async function togglePlayback(forceState) {
             if (Tone.context.state !== 'running') await Tone.start();
@@ -615,6 +682,7 @@
                 state.isPlaying = true;
                 dom.playStopBtn.textContent = 'Stop';
                 dom.playStopBtn.classList.add('bg-red-600'); dom.playStopBtn.classList.remove('bg-blue-600');
+                renderGrid();
                 updateNextRecordStepVisual();
             } else { 
                 Tone.Transport.stop();
@@ -622,6 +690,7 @@
                 state.isPlaying = false;
                 dom.playStopBtn.textContent = 'Play';
                 dom.playStopBtn.classList.add('bg-blue-600'); dom.playStopBtn.classList.remove('bg-red-600');
+                renderGrid();
                 updatePlayheadUI(state.currentStep, -1);
                 state.currentStep = -1;
                 updateNextRecordStepVisual();
@@ -781,6 +850,7 @@
             
             let html = `
                 <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Oscillator</h4>
+                <div class="flex items-center"><label class="w-28 text-sm">Type</label><select data-param-object="oscillator" data-param="type" class="w-full bg-gray-600 rounded p-1 instrument-control">${['sine', 'square', 'sawtooth', 'triangle', 'fatsawtooth', 'pulse', 'pwm'].map(o => `<option value="${o}" ${o === oscParams.type ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
                 ${createSlider('Detune', oscParams, 'oscillator', 'detune', 0, 100, 0.1)}
                 <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Amp Env</h4>
                 ${createSlider('Attack', envParams, 'envelope', 'attack', 0.001, 1, 0.001)}
@@ -831,14 +901,16 @@
             }
 
             if (el.classList.contains('instrument-control')) {
-                let paramValue = parseFloat(el.value);
                 const { param, paramObject } = el.dataset;
+                const paramValue = el.type === 'range' ? parseFloat(el.value) : el.value;
+
                 if(param && paramObject && track.synthParams[paramObject]) {
-                    // Update state object first
                     track.synthParams[paramObject][param] = paramValue;
-                    // Then update the audio engine
-                    let settings = { [paramObject]: { [param]: paramValue } };
-                    track.source.set(settings);
+                    track.source.set({ [paramObject]: { [param]: paramValue } });
+                    
+                    if (param === 'type' && paramObject === 'oscillator') {
+                        renderDynamicSynthParams(track); 
+                    }
                 }
             }
         }
@@ -965,6 +1037,18 @@
                         const stepIndex = parseInt(target.dataset.step);
                         handleStepClick(trackIndex, stepIndex, e);
                         break;
+                    case 'playhead-left':
+                        if (state.armedTrackIndex > -1 && !state.isPlaying) {
+                            state.nonPlayStepIndices[state.armedTrackIndex] = (state.nonPlayStepIndices[state.armedTrackIndex] - 1 + NUM_STEPS) % NUM_STEPS;
+                            updateNextRecordStepVisual();
+                        }
+                        break;
+                    case 'playhead-right':
+                        if (state.armedTrackIndex > -1 && !state.isPlaying) {
+                            state.nonPlayStepIndices[state.armedTrackIndex] = (state.nonPlayStepIndices[state.armedTrackIndex] + 1) % NUM_STEPS;
+                            updateNextRecordStepVisual();
+                        }
+                        break;
                 }
             });
              dom.gridContainer.addEventListener('dblclick', e => {
@@ -974,6 +1058,15 @@
                      const trackIndex = parseInt(trackRow.dataset.trackIndex);
                      const stepIndex = parseInt(target.dataset.step);
                      openStepDetailModal(trackIndex, stepIndex);
+                }
+            });
+            dom.gridContainer.addEventListener('change', e => {
+                const target = e.target;
+                if (target.dataset.action === 'load-sample-input') {
+                    const trackRow = target.closest('.track-row');
+                    if (!trackRow) return;
+                    const trackIndex = parseInt(trackRow.dataset.trackIndex);
+                    loadSample(e, trackIndex);
                 }
             });
 
@@ -998,17 +1091,8 @@
                         case 'out-port': track.midiOutPortId = e.target.value; break;
                         case 'out-chan': track.midiOutChan = e.target.value; break;
                     }
-                }
-            });
-
-            window.addEventListener('resize', () => {
-                const newNumSteps = window.innerWidth >= LARGE_SCREEN_BREAKPOINT ? 32 : 16;
-                if (newNumSteps !== NUM_STEPS) {
-                    NUM_STEPS = newNumSteps;
-                    sequenceLoop.cancel();
-                    sequenceLoop.events = Array.from({length: NUM_STEPS}, (_,i) => i);
-                    sequenceLoop.start(0);
-                    renderGrid();
+                } else if(e.target.matches('#synth-algorithm') || (e.target.matches('.instrument-control[data-param="type"]'))) {
+                    handleTrackSettingsChange(e);
                 }
             });
             

@@ -135,72 +135,98 @@
     </div>
 
     <script type="module">
-        // --- DOM ELEMENTS & STATE ---
-        const gridContainer = document.getElementById('sequencer-grid');
-        const playStopBtn = document.getElementById('play-stop-btn');
-        const tempoSlider = document.getElementById('tempo-slider');
-        const tempoDisplay = document.getElementById('tempo-display');
-        const noteInputGridContainer = document.getElementById('note-input-grid');
-        const modalsContainer = document.getElementById('modals-container');
-        const addTrackBtn = document.getElementById('add-track-btn');
-        const removeTrackBtn = document.getElementById('remove-track-btn');
-        let clockSourceSelect;
-
-        const NUM_STEPS = 16;
-        let stepGrid = [], isPlaying = false, currentStep = -1, midiAccess = null;
-        let midiInputs = [], midiOutputs = [];
-        let armedTrackIndex = -1, selectedTrackIndex = 0, activeTrackIndexForModal = -1, activeStepForModal = null, tracks = [], soloedTrackIndex = -1;
-        let nonPlayStepIndices = [];
-        let lastPressedNote = null;
-        let listenersInitialized = false;
-
-        // MIDI Clock state
-        let currentClockSourceId = 'internal';
-        let lastClockTime = 0;
-        const clockIntervals = [];
-        const CLOCK_INTERVAL_BUFFER_SIZE = 48; // Average over 2 beats for stability
-
+        // --- CONSTANTS ---
+        const LARGE_SCREEN_BREAKPOINT = 1024;
+        let NUM_STEPS = window.innerWidth >= LARGE_SCREEN_BREAKPOINT ? 32 : 16;
         const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-        const NOTE_INPUT_OCTAVES = 7, NOTE_INPUT_START_OCTAVE = 1;
+        const NOTE_INPUT_OCTAVES = 7;
+        const NOTE_INPUT_START_OCTAVE = 1;
+        const CLOCK_INTERVAL_BUFFER_SIZE = 48; // For smoothing MIDI clock
         const SYNTH_ALGORITHMS = {
             'VA': 'Virtual Analog',
             'FM': 'FM',
             'Pluck': 'Plucked String',
             'Wavefolder': 'Wavefolder'
         };
+        
+        // --- DOM ELEMENT CACHE ---
+        const dom = {
+            gridContainer: document.getElementById('sequencer-grid'),
+            playStopBtn: document.getElementById('play-stop-btn'),
+            tempoSlider: document.getElementById('tempo-slider'),
+            tempoDisplay: document.getElementById('tempo-display'),
+            noteInputGrid: document.getElementById('note-input-grid'),
+            modalsContainer: document.getElementById('modals-container'),
+            addTrackBtn: document.getElementById('add-track-btn'),
+            removeTrackBtn: document.getElementById('remove-track-btn'),
+            midiSettingsBtn: document.getElementById('midi-settings-btn'),
+            clockSourceSelect: document.getElementById('clock-source-select'),
+        };
 
-        // --- AUDIO & TRACK INITIALIZATION ---
-        function createSynth(type = 'VA') {
-            let synth;
+        // --- APPLICATION STATE ---
+        const state = {
+            tracks: [],
+            stepGrid: [],
+            nonPlayStepIndices: [],
+            isPlaying: false,
+            currentStep: -1,
+            armedTrackIndex: -1,
+            selectedTrackIndex: 0,
+            soloedTrackIndex: -1,
+            activeModalTrackIndex: -1,
+            activeModalStep: null,
+            lastPressedNote: null,
+            listenersInitialized: false,
+            midi: {
+                access: null,
+                inputs: [],
+                outputs: [],
+                clockSourceId: 'internal',
+                lastClockTime: 0,
+                clockIntervals: [],
+            }
+        };
+
+        // --- SYNTH PARAMETER DEFAULTS ---
+        const getDefaultSynthParams = (type = 'VA') => {
             switch(type) {
                 case 'FM':
-                    synth = new Tone.PolySynth(Tone.FMSynth, {
-                        harmonicity: 3,
-                        modulationIndex: 10,
-                        detune: 0,
+                    return {
+                        harmonicity: 3, modulationIndex: 10, detune: 0,
                         oscillator: { type: "sine" },
                         envelope: { attack: 0.01, decay: 0.2, sustain: 0.2, release: 0.8 },
                         modulation: { type: "square" },
                         modulationEnvelope: { attack: 0.01, decay: 0.5, sustain: 0, release: 0.5 }
-                    });
-                    break;
-                case 'Pluck': synth = new Tone.PolySynth(Tone.PluckSynth, { attackNoise: 1, dampening: 4000, resonance: 0.9 }); break;
+                    };
+                case 'Pluck':
+                    return { attackNoise: 1, dampening: 4000, resonance: 0.9 };
+                case 'Wavefolder':
+                case 'VA':
+                default:
+                    return {
+                        oscillator: { type: 'fatsawtooth', count: 3, detune: 15 },
+                        envelope: { attack: 0.01, decay: 0.2, sustain: 0.5, release: 0.8 },
+                        filter: { Q: 2, type: 'lowpass', rolloff: -12, frequency: 20000 },
+                        filterEnvelope: { attack: 0.06, decay: 0.2, sustain: 0.5, release: 2, baseFrequency: 200, octaves: 7 }
+                    };
+            }
+        };
+
+        // --- AUDIO & TRACK INITIALIZATION ---
+        function createSynth(type = 'VA', params) {
+            let synth;
+            const synthParams = params || getDefaultSynthParams(type);
+            switch(type) {
+                case 'FM': synth = new Tone.PolySynth(Tone.FMSynth, synthParams); break;
+                case 'Pluck': synth = new Tone.PolySynth(Tone.PluckSynth, synthParams); break;
                 case 'Wavefolder':
                     const shaper = new Tone.WaveShaper(val => Math.tanh(val * 4));
-                    const fatOsc = new Tone.PolySynth(Tone.Synth, { oscillator: { type: 'fatsawtooth' } }).connect(shaper);
-                    synth = { 
-                        _source: fatOsc, 
-                        _shaper: shaper, 
-                        connect: function(dest) { this._shaper.connect(dest); return this; }, 
-                        triggerAttackRelease: function(...args) { return this._source.triggerAttackRelease(...args); },
-                        triggerAttack: function(...args) { return this._source.triggerAttack(...args); },
-                        triggerRelease: function(...args) { return this._source.triggerRelease(...args); },
-                        get: function(...args) { return this._source.get(...args); },
-                        set: function(...args) { return this._source.set(...args); },
-                        dispose: function() { this._source.dispose(); this._shaper.dispose(); } 
-                    };
+                    const fatOsc = new Tone.PolySynth(Tone.Synth, synthParams).connect(shaper);
+                    synth = { _source: fatOsc, _shaper: shaper, connect: function(dest) { this._shaper.connect(dest); return this; }, triggerAttackRelease: function(...args) { return this._source.triggerAttackRelease(...args); }, triggerAttack: function(...args) { return this._source.triggerAttack(...args); }, triggerRelease: function(...args) { return this._source.triggerRelease(...args); }, get: function(...args) { return this._source.get(...args); }, set: function(...args) { return this._source.set(...args); }, dispose: function() { this._source.dispose(); this._shaper.dispose(); } };
                     break;
-                case 'VA': default: synth = new Tone.PolySynth(Tone.Synth, { oscillator: { type: 'fatsawtooth' }, envelope: { attack: 0.01, decay: 0.2, sustain: 0.5, release: 0.8 } });
+                case 'VA': 
+                default: 
+                    synth = new Tone.PolySynth(Tone.Synth, synthParams);
             }
             return synth;
         }
@@ -210,35 +236,22 @@
             const reverb = new Tone.Reverb({ wet: 0, decay: 1.5 }).connect(channel);
             const delay = new Tone.FeedbackDelay({ wet: 0, delayTime: "8n", feedback: 0.5 }).connect(reverb);
             const phaser = new Tone.Phaser({ wet: 0, frequency: 0.5, octaves: 3, baseFrequency: 350 }).connect(delay);
-            const source = createSynth().connect(phaser);
             
-            return { 
-                name: `Track ${index + 1}`, 
-                source, 
-                type: 'Synth', 
-                algorithm: 'VA', 
-                channel, reverb, delay, phaser,
-                midiInPortId: "none", midiOutPortId: "none", midiInChan: "all", midiOutChan: 1, 
-                muteInternal: false, isMuted: false,
-            };
+            const initialParams = getDefaultSynthParams('VA');
+            const source = createSynth('VA', initialParams).connect(phaser);
+            
+            return { name: `Track ${index + 1}`, source, type: 'Synth', algorithm: 'VA', channel, reverb, delay, phaser, midiInPortId: "none", midiOutPortId: "none", midiInChan: "all", midiOutChan: 1, muteInternal: false, isMuted: false, pitch: 0, synthParams: initialParams };
         }
         
-        // --- STABLE UI RENDERING ENGINE ---
+        // --- UI RENDERING ---
         function renderAll() {
-            try {
-                applyMuteAndSoloState();
-                renderModals();
-                renderGrid();
-                renderNoteInputGrid();
-                renderMidiSettings();
-            } catch (error) {
-                console.error("A critical error occurred during rendering:", error);
-                document.body.innerHTML = `<div class="p-8 text-red-500 bg-red-100">A fatal error occurred. Please check the developer console for details.</div>`;
-            }
+            renderModals();
+            renderGrid();
+            renderNoteInputGrid();
         }
         
         function renderModals() {
-            modalsContainer.innerHTML = `
+            dom.modalsContainer.innerHTML = `
                 <!-- Track Settings Modal -->
                 <div id="track-settings-modal" class="modal fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center hidden p-4 z-50">
                     <div class="bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-lg border border-gray-700 space-y-4 max-h-[90vh] modal-scroll-content overflow-y-auto">
@@ -284,98 +297,53 @@
         }
 
         function renderGrid() {
-            gridContainer.innerHTML = '';
-            tracks.forEach((track, trackIndex) => {
+            dom.gridContainer.innerHTML = '';
+            state.tracks.forEach((track, trackIndex) => {
                 const trackDiv = document.createElement('div');
-                trackDiv.className = `track-row p-2 grid grid-cols-[auto_1fr] gap-x-4 items-center ${trackIndex === selectedTrackIndex ? 'selected' : ''}`;
+                trackDiv.className = `track-row p-2 grid grid-cols-[auto_1fr] gap-x-4 items-center ${trackIndex === state.selectedTrackIndex ? 'selected' : ''}`;
                 trackDiv.id = `track-row-${trackIndex}`;
                 trackDiv.dataset.trackIndex = trackIndex;
 
-                const infoPanel = document.createElement('div');
-                infoPanel.className = 'flex flex-col sm:flex-row items-center gap-2 flex-shrink-0 cursor-pointer';
-                infoPanel.onclick = () => selectTrack(trackIndex);
-                
-                const label = document.createElement('div');
-                label.className = 'w-24 font-semibold text-gray-400 truncate text-right';
-                label.textContent = track.name;
-                label.ondblclick = (e) => { e.stopPropagation(); editTrackName(e.target, trackIndex); };
-                infoPanel.appendChild(label);
-                
-                const allButtonsContainer = document.createElement('div');
-                allButtonsContainer.className = 'flex flex-col gap-1 w-28';
-
-                const buttonRowTop = document.createElement('div');
-                buttonRowTop.className = 'flex items-center gap-1';
-
-                const armBtn = document.createElement('button');
-                armBtn.textContent = 'Arm';
-                armBtn.className = `arm-btn text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded grow ${trackIndex === armedTrackIndex ? 'armed' : ''}`;
-                armBtn.onclick = (e) => { e.stopPropagation(); armTrack(trackIndex); };
-                buttonRowTop.appendChild(armBtn);
-
-                const muteBtn = document.createElement('button');
-                muteBtn.textContent = 'M';
-                muteBtn.title = 'Mute Track';
-                muteBtn.className = `mute-btn text-xs px-2 py-1 rounded w-8 ${track.isMuted ? 'muted' : 'bg-gray-600 hover:bg-gray-500'}`;
-                muteBtn.onclick = (e) => { e.stopPropagation(); toggleMute(trackIndex); };
-                buttonRowTop.appendChild(muteBtn);
-                
-                const soloBtn = document.createElement('button');
-                soloBtn.textContent = 'S';
-                soloBtn.title = 'Solo Track';
-                soloBtn.className = `solo-btn text-xs px-2 py-1 rounded w-8 ${trackIndex === soloedTrackIndex ? 'soloed' : 'bg-gray-600 hover:bg-gray-500'}`;
-                soloBtn.onclick = (e) => { e.stopPropagation(); toggleSolo(trackIndex); };
-                buttonRowTop.appendChild(soloBtn);
-                allButtonsContainer.appendChild(buttonRowTop);
-
-                const settingsBtn = document.createElement('button');
-                settingsBtn.textContent = 'Settings';
-                settingsBtn.className = 'text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded w-full';
-                settingsBtn.onclick = (e) => { e.stopPropagation(); openTrackSettingsModal(trackIndex); };
-                allButtonsContainer.appendChild(settingsBtn);
-                
-                const loadBtn = document.createElement('button');
-                loadBtn.textContent = 'Load Sample';
-                loadBtn.className = 'text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded w-full';
-                const fileInput = document.createElement('input');
-                fileInput.type = 'file';
-                fileInput.accept = '.wav,.aif,.aiff,.mp3';
-                fileInput.className = 'hidden';
-                loadBtn.onclick = (e) => { e.stopPropagation(); fileInput.click(); };
-                fileInput.onchange = (e) => { e.stopPropagation(); loadSample(e, trackIndex); };
-                allButtonsContainer.appendChild(loadBtn);
-                allButtonsContainer.appendChild(fileInput);
-                
-                const clearBtn = document.createElement('button');
-                clearBtn.textContent = 'Clear';
-                clearBtn.className = 'clear-btn text-xs bg-red-800 hover:bg-red-700 px-2 py-1 rounded w-full';
-                clearBtn.onclick = (e) => { e.stopPropagation(); clearSample(trackIndex); };
-                allButtonsContainer.appendChild(clearBtn);
-
-                infoPanel.appendChild(allButtonsContainer);
-                
-                trackDiv.appendChild(infoPanel);
-
                 const stepsContainer = document.createElement('div');
-                stepsContainer.className = 'grid grid-cols-8 sm:grid-cols-16 gap-1.5';
-                for (let stepIndex = 0; stepIndex < NUM_STEPS; stepIndex++) {
+                stepsContainer.className = 'grid gap-1.5';
+                const cols = NUM_STEPS === 32 ? 16 : 8;
+                stepsContainer.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+                if(NUM_STEPS === 32) stepsContainer.style.gridTemplateRows = 'repeat(2, minmax(0, 1fr))';
+
+
+                for(let stepIndex = 0; stepIndex < NUM_STEPS; stepIndex++) {
+                    const hasNotes = state.stepGrid[trackIndex]?.[stepIndex]?.length > 0;
                     const stepButton = document.createElement('button');
-                    const hasNotes = stepGrid[trackIndex]?.[stepIndex]?.length > 0;
                     stepButton.className = `step h-10 w-full rounded-md ${(stepIndex % 4 === 0) ? 'accent' : ''} ${hasNotes ? 'active' : ''}`;
-                    stepButton.dataset.track = trackIndex;
                     stepButton.dataset.step = stepIndex;
-                    stepButton.onclick = (e) => handleStepClick(e, trackIndex, stepIndex);
-                    stepButton.ondblclick = () => openStepDetailModal(trackIndex, stepIndex);
+                    stepButton.dataset.action = "handle-step-click";
+                    stepButton.dataset.dblaction = "open-step-detail";
                     stepsContainer.appendChild(stepButton);
                 }
+
+                trackDiv.innerHTML = `
+                    <div class="flex flex-col sm:flex-row items-center gap-2 flex-shrink-0 cursor-pointer" data-action="select-track">
+                        <div class="w-24 font-semibold text-gray-400 truncate text-right" data-action="edit-track-name">${track.name}</div>
+                        <div class="flex flex-col gap-1 w-28">
+                            <div class="flex items-center gap-1">
+                                <button class="arm-btn text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded grow ${trackIndex === state.armedTrackIndex ? 'armed' : ''}" data-action="arm-track">Arm</button>
+                                <button class="mute-btn text-xs px-2 py-1 rounded w-8 ${track.isMuted ? 'muted' : 'bg-gray-600 hover:bg-gray-500'}" title="Mute Track" data-action="toggle-mute">M</button>
+                                <button class="solo-btn text-xs px-2 py-1 rounded w-8 ${trackIndex === state.soloedTrackIndex ? 'soloed' : 'bg-gray-600 hover:bg-gray-500'}" title="Solo Track" data-action="toggle-solo">S</button>
+                            </div>
+                            <button class="text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded w-full" data-action="open-track-settings">Settings</button>
+                            <button class="text-xs bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded w-full" data-action="load-sample">Load Sample</button>
+                            <input type="file" accept=".wav,.aif,.aiff,.mp3" class="hidden" data-action="load-sample-input">
+                            <button class="clear-btn text-xs bg-red-800 hover:bg-red-700 px-2 py-1 rounded w-full ${track.type !== 'Sampler' ? 'hidden' : ''}" data-action="clear-sample">Clear</button>
+                        </div>
+                    </div>
+                `;
                 trackDiv.appendChild(stepsContainer);
-                gridContainer.appendChild(trackDiv);
-                updateTrackTypeUI(trackIndex, track.type);
+                dom.gridContainer.appendChild(trackDiv);
             });
         }
         
         function renderNoteInputGrid() {
-            noteInputGridContainer.innerHTML = '';
+            dom.noteInputGrid.innerHTML = '';
             for (let oct = 0; oct < NOTE_INPUT_OCTAVES; oct++) {
                 for(let i = 0; i < 12; i++) {
                     const noteIndex = i % 12;
@@ -385,113 +353,232 @@
                     const btn = document.createElement('button');
                     btn.className = `note-input-btn rounded-md text-xs font-mono h-full ${isSharp ? 'sharp col-start-auto' : 'col-span-1'}`;
                     btn.dataset.note = noteName;
-                    noteInputGridContainer.appendChild(btn);
+                    dom.noteInputGrid.appendChild(btn);
                 }
             }
-        }
-
-        function editTrackName(labelElement, trackIndex) {
-            labelElement.style.display = 'none';
-            const input = document.createElement('input');
-            input.type = 'text'; input.value = tracks[trackIndex].name;
-            input.className = 'bg-gray-900 text-white w-24 p-1 rounded';
-            labelElement.parentElement.appendChild(input);
-            input.focus();
-            const saveName = () => { tracks[trackIndex].name = input.value; input.remove(); renderAll(); };
-            input.onblur = saveName;
-            input.onkeydown = (e) => { if (e.key === 'Enter') saveName(); };
         }
         
-        function addTrack() { 
-            tracks.push(createNewTrack(tracks.length)); 
-            stepGrid.push(Array.from({ length: NUM_STEPS }, () => []));
-            nonPlayStepIndices.push(0);
-            renderAll(); 
+        // --- UI UPDATES (Optimized) ---
+        function updatePlayheadUI(prevStep, nextStep) {
+            if (prevStep > -1) document.querySelectorAll(`[data-step="${prevStep}"]`).forEach(el => el.classList.remove('current'));
+            if (nextStep > -1) document.querySelectorAll(`[data-step="${nextStep}"]`).forEach(el => el.classList.add('current'));
         }
-        function removeLastTrack() {
-            if (tracks.length <= 1) return;
-            const wasArmed = armedTrackIndex === tracks.length - 1;
-            const wasSelected = selectedTrackIndex === tracks.length - 1;
 
-            const removedTrack = tracks.pop();
-            if(removedTrack.source) removedTrack.source.dispose(); 
-            if(removedTrack.channel) removedTrack.channel.dispose();
-            stepGrid.pop();
-            nonPlayStepIndices.pop();
-
-            if (wasArmed) armedTrackIndex = -1;
-            if (wasSelected) selectTrack(selectedTrackIndex - 1);
-            if (soloedTrackIndex === tracks.length) {
-                soloedTrackIndex = -1;
+        function updateStepButtonUI(trackIndex, stepIndex) {
+            const stepButton = document.querySelector(`[data-track-index="${trackIndex}"] [data-step="${stepIndex}"]`);
+            if (stepButton) {
+                stepButton.classList.toggle('active', state.stepGrid[trackIndex]?.[stepIndex]?.length > 0);
             }
-            
-            renderAll();
         }
-        function loadSample(event, trackIndex) {
-            const file = event.target.files[0]; if (!file) return;
-            const url = URL.createObjectURL(file);
-            const sampler = new Tone.Sampler({ 
-                urls: { C4: url },
-                attack: 0.01,
-                release: 0.1,
-                onload: () => {
-                    if (tracks[trackIndex].source) tracks[trackIndex].source.dispose();
-                    tracks[trackIndex].source = sampler.connect(tracks[trackIndex].phaser);
-                    tracks[trackIndex].name = file.name.replace(/\.[^/.]+$/, "");
-                    tracks[trackIndex].pitch = 0; // Add pitch property for samplers
-                    updateTrackTypeUI(trackIndex, 'Sampler');
-                    renderAll();
-                    URL.revokeObjectURL(url);
-                }
+
+        function updateTrackSelectionUI(prevIndex, nextIndex) {
+            if (prevIndex > -1) document.getElementById(`track-row-${prevIndex}`)?.classList.remove('selected');
+            if (nextIndex > -1) document.getElementById(`track-row-${nextIndex}`)?.classList.add('selected');
+        }
+
+        function updateArmButtonUI(trackIndex) {
+             const armBtn = document.querySelector(`#track-row-${trackIndex} [data-action="arm-track"]`);
+             if (armBtn) armBtn.classList.toggle('armed', state.armedTrackIndex === trackIndex);
+        }
+
+        function updateMuteSoloUI() {
+            state.tracks.forEach((track, index) => {
+                const row = document.getElementById(`track-row-${index}`);
+                if (!row) return;
+                const isSoloed = state.soloedTrackIndex > -1;
+                const isMuted = track.isMuted;
+                const effectiveMute = isSoloed ? (index !== state.soloedTrackIndex) : isMuted;
+
+                track.channel.mute = effectiveMute;
+                
+                const muteBtn = row.querySelector('[data-action="toggle-mute"]');
+                const soloBtn = row.querySelector('[data-action="toggle-solo"]');
+                if (muteBtn) muteBtn.classList.toggle('muted', isMuted);
+                if (soloBtn) soloBtn.classList.toggle('soloed', index === state.soloedTrackIndex);
             });
         }
-        function clearSample(trackIndex) {
-            if (tracks[trackIndex].type !== 'Sampler') return;
-            if (tracks[trackIndex].source) tracks[trackIndex].source.dispose();
-            tracks[trackIndex].source = createSynth().connect(tracks[trackIndex].phaser);
-            tracks[trackIndex].name = `Track ${trackIndex + 1}`;
-            delete tracks[trackIndex].pitch; // remove pitch property
-            updateTrackTypeUI(trackIndex, 'Synth');
-            renderAll();
+        
+        // --- LOGIC & ACTIONS ---
+        function addTrack() { 
+            const newIndex = state.tracks.length;
+            state.tracks.push(createNewTrack(newIndex)); 
+            state.stepGrid.push(Array.from({ length: 32 }, () => []));
+            state.nonPlayStepIndices.push(0);
+            renderGrid(); 
         }
-        function updateTrackTypeUI(trackIndex, type) {
-            tracks[trackIndex].type = type;
-            const trackRow = document.getElementById(`track-row-${trackIndex}`);
-            if (trackRow) {
-                trackRow.querySelector('.clear-btn').style.display = type === 'Sampler' ? 'inline-block' : 'none';
+        function removeLastTrack() {
+            if (state.tracks.length <= 1) return;
+            const wasArmed = state.armedTrackIndex === state.tracks.length - 1;
+            const wasSelected = state.selectedTrackIndex === state.tracks.length - 1;
+
+            const removedTrack = state.tracks.pop();
+            if(removedTrack.source) removedTrack.source.dispose(); 
+            if(removedTrack.channel) removedTrack.channel.dispose();
+            state.stepGrid.pop();
+            state.nonPlayStepIndices.pop();
+
+            if (wasArmed) state.armedTrackIndex = -1;
+            if (wasSelected) selectTrack(state.selectedTrackIndex - 1);
+            if (state.soloedTrackIndex === state.tracks.length) {
+                state.soloedTrackIndex = -1;
+                updateMuteSoloUI();
             }
+            renderGrid();
+        }
+
+        function selectTrack(trackIndex) {
+            if (trackIndex < 0 || trackIndex >= state.tracks.length || trackIndex === state.selectedTrackIndex) return;
+            const prevIndex = state.selectedTrackIndex;
+            state.selectedTrackIndex = trackIndex;
+            updateTrackSelectionUI(prevIndex, trackIndex);
+        }
+
+        function armTrack(trackIndex) {
+            const prevArmed = state.armedTrackIndex;
+            if (prevArmed === trackIndex) {
+                state.armedTrackIndex = -1;
+            } else {
+                state.armedTrackIndex = trackIndex;
+                if(state.selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
+            }
+            if (prevArmed > -1) updateArmButtonUI(prevArmed);
+            updateArmButtonUI(trackIndex);
+            updateNextRecordStepVisual();
+        }
+
+        function toggleMute(trackIndex) {
+            state.tracks[trackIndex].isMuted = !state.tracks[trackIndex].isMuted;
+            updateMuteSoloUI();
+        }
+
+        function toggleSolo(trackIndex) {
+            state.soloedTrackIndex = (state.soloedTrackIndex === trackIndex) ? -1 : trackIndex;
+            updateMuteSoloUI();
+        }
+
+        function updateNextRecordStepVisual() {
+            document.querySelectorAll('.next-record-step').forEach(el => el.classList.remove('next-record-step'));
+            if (!state.isPlaying && state.armedTrackIndex > -1) {
+                const nextStepIndex = state.nonPlayStepIndices[state.armedTrackIndex];
+                const nextStepElement = document.querySelector(`[data-track-index="${state.armedTrackIndex}"] [data-step="${nextStepIndex}"]`);
+                if (nextStepElement) nextStepElement.classList.add('next-record-step');
+            }
+        }
+        
+        function handleStepClick(trackIndex, stepIndex, event) {
+            if (event.ctrlKey || event.metaKey) {
+                clearStep(trackIndex, stepIndex);
+                return;
+            }
+            
+            const track = state.tracks[trackIndex];
+            if (track.type === 'Sampler') {
+                const stepHasNote = state.stepGrid[trackIndex][stepIndex].length > 0;
+                if (stepHasNote) {
+                    clearStep(trackIndex, stepIndex);
+                } else {
+                    recordNote(trackIndex, stepIndex, 'C4', 100, 0, 1);
+                    if (!track.channel.mute) {
+                        const pitchOffset = track.pitch || 0;
+                        const finalNote = midiToNoteName(noteNameToMidi('C4') + pitchOffset);
+                        track.source.triggerAttack(finalNote);
+                    }
+                }
+            } else if (track.type === 'Synth') {
+                 if (state.stepGrid[trackIndex][stepIndex].length === 0 && state.armedTrackIndex === trackIndex) {
+                    state.nonPlayStepIndices[state.armedTrackIndex] = stepIndex;
+                    updateNextRecordStepVisual();
+                 } else {
+                    clearStep(trackIndex, stepIndex);
+                 }
+            }
+        }
+        
+        function handleNoteOn(note, velocity = 100) {
+            const activeTrackForPlayback = (state.armedTrackIndex > -1) ? state.armedTrackIndex : state.selectedTrackIndex;
+
+            if (activeTrackForPlayback > -1) {
+                const track = state.tracks[activeTrackForPlayback];
+                if (!track.muteInternal && !track.channel.mute) {
+                    if (track.type === 'Sampler') {
+                         const pitchOffset = track.pitch || 0;
+                        const finalNote = midiToNoteName(noteNameToMidi('C4') + pitchOffset);
+                        track.source.triggerAttack(finalNote, Tone.now(), velocity/127);
+                    } else {
+                        track.source.triggerAttack(note, Tone.now(), velocity / 127);
+                    }
+                }
+
+                if (state.armedTrackIndex > -1) {
+                    if (state.isPlaying && state.currentStep > -1) {
+                        recordNote(state.armedTrackIndex, state.currentStep, note, velocity, 0, 1);
+                    } else if (!state.isPlaying) {
+                        const recordStep = state.nonPlayStepIndices[state.armedTrackIndex];
+                        recordNote(state.armedTrackIndex, recordStep, note, velocity, 0, 1);
+                        updateNextRecordStepVisual();
+                    }
+                }
+            }
+            document.querySelector(`[data-note="${note}"]`)?.classList.add('pressed');
+        }
+
+        function handleNoteOff(note) {
+            if (!note) return;
+            const activeTrackForPlayback = (state.armedTrackIndex > -1) ? state.armedTrackIndex : state.selectedTrackIndex;
+            if (activeTrackForPlayback > -1) {
+                const track = state.tracks[activeTrackForPlayback];
+                if (track.type === 'Synth' && typeof track.source.triggerRelease === 'function' && !track.muteInternal) {
+                    track.source.triggerRelease(note);
+                }
+            }
+            document.querySelector(`[data-note="${note}"]`)?.classList.remove('pressed');
+            if (state.lastPressedNote === note) {
+                state.lastPressedNote = null;
+            }
+        }
+
+        function recordNote(trackIndex, stepIndex, note, velocity, offset, ratchet) {
+            const stepData = state.stepGrid[trackIndex][stepIndex];
+            if (!stepData.some(n => n.note === note)) {
+                stepData.push({ note, velocity, offset, ratchet });
+                stepData.sort((a,b) => (noteNameToMidi(a.note) || 0) - (noteNameToMidi(b.note) || 0));
+                updateStepButtonUI(trackIndex, stepIndex);
+            }
+        }
+
+        function clearStep(trackIndex, stepIndex) {
+            state.stepGrid[trackIndex][stepIndex] = [];
+            updateStepButtonUI(trackIndex, stepIndex);
         }
 
         // --- SEQUENCER & AUDIO LOGIC ---
         const sequenceLoop = new Tone.Sequence((time, step) => {
-            Tone.Draw.schedule(() => updatePlayhead(step), time);
-            tracks.forEach((track, trackIndex) => {
-                const notesInStep = stepGrid[trackIndex]?.[step];
+            Tone.Draw.schedule(() => {
+                updatePlayheadUI(state.currentStep, step);
+                state.currentStep = step;
+            }, time);
+            
+            state.tracks.forEach((track, trackIndex) => {
+                const notesInStep = state.stepGrid[trackIndex]?.[step];
                 if (notesInStep && notesInStep.length > 0) {
                     const sixteenthDur = Tone.Time('16n').toSeconds();
                     const firstNoteData = notesInStep[0]; 
                     const velocity = firstNoteData.velocity || 100;
                     const offset = firstNoteData.offset || 0;
                     const mainOffsetSec = sixteenthDur * (offset / 100);
-
                     const ratchetCount = firstNoteData.ratchet || 1;
                     const ratchetDurSec = sixteenthDur / ratchetCount;
 
                     if (!track.muteInternal) {
-                        // For samplers, ensure monophonic playback by stopping previous notes.
-                        if (track.type === 'Sampler') {
-                           track.source.releaseAll(time);
-                        }
-
+                        if (track.type === 'Sampler') track.source.releaseAll(time);
                         for (let i = 0; i < ratchetCount; i++) {
                             const ratchetOffset = i * ratchetDurSec;
                             const triggerTime = time + mainOffsetSec + ratchetOffset;
                             const noteNames = notesInStep.map(n => n.note);
                             const velNorm = velocity / 127;
-                            
                             if (track.type === 'Sampler') {
                                 const pitchOffset = track.pitch || 0;
-                                const baseMidi = noteNameToMidi('C4'); // Samples are based on C4
+                                const baseMidi = noteNameToMidi('C4');
                                 if (baseMidi !== null) {
                                     const finalNote = midiToNoteName(baseMidi + pitchOffset);
                                     track.source.triggerAttack(finalNote, triggerTime, velNorm);
@@ -503,195 +590,45 @@
                         }
                     }
 
-                    // --- MIDI OUT LOGIC ---
-                    if (track.midiOutPortId !== 'none' && midiAccess) {
-                        const output = midiOutputs.find(o => o.id === track.midiOutPortId);
+                    if (track.midiOutPortId !== 'none' && state.midi.access) {
+                        const output = state.midi.outputs.find(o => o.id === track.midiOutPortId);
                         if (output) {
                             notesInStep.forEach(noteData => {
                                 const midiNote = noteNameToMidi(noteData.note);
                                 if (midiNote === null) return;
-                                const noteOnCmd = 0x90 + (parseInt(track.midiOutChan) - 1);
-                                const noteOffCmd = 0x80 + (parseInt(track.midiOutChan) - 1);
                                 const onTime = performance.now() + ((time + mainOffsetSec) - Tone.now()) * 1000;
                                 const offTime = onTime + (sixteenthDur * 0.9 * 1000);
-                                output.send([noteOnCmd, midiNote, velocity], onTime);
-                                output.send([noteOffCmd, midiNote, 0], offTime);
+                                output.send([0x90 + (parseInt(track.midiOutChan) - 1), midiNote, velocity], onTime);
+                                output.send([0x80 + (parseInt(track.midiOutChan) - 1), midiNote, 0], offTime);
                             });
                         }
                     }
                 }
             });
-        }, Array.from({ length: NUM_STEPS }, (_, i) => i), '16n').start(0);
+        }, Array.from({ length: 32 }, (_, i) => i), '16n').start(0);
 
         async function togglePlayback(forceState) {
             if (Tone.context.state !== 'running') await Tone.start();
-
-            const targetState = typeof forceState === 'boolean' ? forceState : !isPlaying;
-
+            const targetState = typeof forceState === 'boolean' ? forceState : !state.isPlaying;
             if (targetState) {
                 Tone.Transport.start();
-                isPlaying = true;
-                playStopBtn.textContent = 'Stop';
-                playStopBtn.classList.add('bg-red-600');
-                playStopBtn.classList.remove('bg-blue-600');
-                document.querySelectorAll('.next-record-step').forEach(el => el.classList.remove('next-record-step'));
+                state.isPlaying = true;
+                dom.playStopBtn.textContent = 'Stop';
+                dom.playStopBtn.classList.add('bg-red-600'); dom.playStopBtn.classList.remove('bg-blue-600');
+                updateNextRecordStepVisual();
             } else { 
                 Tone.Transport.stop();
-                tracks.forEach(track => {
-                    if (track.source && typeof track.source.releaseAll === 'function') {
-                        track.source.releaseAll();
-                    }
-                });
-                isPlaying = false;
-                playStopBtn.textContent = 'Play';
-                playStopBtn.classList.add('bg-blue-600');
-                playStopBtn.classList.remove('bg-red-600');
-                updatePlayhead(-1);
+                state.tracks.forEach(track => { if (track.source && typeof track.source.releaseAll === 'function') track.source.releaseAll(); });
+                state.isPlaying = false;
+                dom.playStopBtn.textContent = 'Play';
+                dom.playStopBtn.classList.add('bg-blue-600'); dom.playStopBtn.classList.remove('bg-red-600');
+                updatePlayheadUI(state.currentStep, -1);
+                state.currentStep = -1;
                 updateNextRecordStepVisual();
             }
         }
-
-        function updatePlayhead(nextStep) {
-            document.querySelectorAll(`[data-step="${currentStep}"]`).forEach(el => el.classList.remove('current'));
-            if (nextStep > -1) document.querySelectorAll(`[data-step="${nextStep}"]`).forEach(el => el.classList.add('current'));
-            currentStep = nextStep;
-        }
-
-        function selectTrack(trackIndex) {
-            if (trackIndex < 0 || trackIndex >= tracks.length) return;
-            selectedTrackIndex = trackIndex;
-            renderGrid();
-        }
-
-        function armTrack(trackIndex) {
-            if (armedTrackIndex === trackIndex) {
-                armedTrackIndex = -1;
-            } else {
-                armedTrackIndex = trackIndex;
-                if (selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
-            }
-            renderGrid();
-            updateNextRecordStepVisual();
-        }
-
-        function toggleMute(trackIndex) {
-            tracks[trackIndex].isMuted = !tracks[trackIndex].isMuted;
-            applyMuteAndSoloState();
-            renderGrid();
-        }
-
-        function toggleSolo(trackIndex) {
-            if (soloedTrackIndex === trackIndex) {
-                soloedTrackIndex = -1; 
-            } else {
-                soloedTrackIndex = trackIndex; 
-            }
-            applyMuteAndSoloState();
-            renderGrid();
-        }
-
-        function applyMuteAndSoloState() {
-            if (soloedTrackIndex === -1) {
-                tracks.forEach(track => {
-                    track.channel.mute = track.isMuted;
-                });
-            } else { 
-                tracks.forEach((track, index) => {
-                    track.channel.mute = (index !== soloedTrackIndex);
-                });
-            }
-        }
-
-        function updateNextRecordStepVisual() {
-            document.querySelectorAll('.next-record-step').forEach(el => el.classList.remove('next-record-step'));
-            if (!isPlaying && armedTrackIndex > -1) {
-                const nextStepIndex = nonPlayStepIndices[armedTrackIndex];
-                const nextStepElement = document.querySelector(`[data-track="${armedTrackIndex}"][data-step="${nextStepIndex}"]`);
-                if (nextStepElement) {
-                    nextStepElement.classList.add('next-record-step');
-                }
-            }
-        }
-
-        function handleStepClick(event, trackIndex, stepIndex) {
-            if (event.ctrlKey || event.metaKey) {
-                clearStep(trackIndex, stepIndex);
-                return;
-            }
-            
-            const track = tracks[trackIndex];
-            if (track.type === 'Sampler') {
-                const stepHasNote = stepGrid[trackIndex][stepIndex].length > 0;
-                if (stepHasNote) clearStep(trackIndex, stepIndex);
-                else {
-                    recordNote(trackIndex, stepIndex, 'C4', 100, 0, 1);
-                    if (!track.channel.mute) {
-                        const pitchOffset = track.pitch || 0;
-                        const finalNote = midiToNoteName(noteNameToMidi('C4') + pitchOffset);
-                        track.source.triggerAttack(finalNote);
-                    }
-                }
-            } else if (track.type === 'Synth') {
-                 if (stepGrid[trackIndex][stepIndex].length === 0 && armedTrackIndex === trackIndex) {
-                    nonPlayStepIndices[armedTrackIndex] = stepIndex;
-                    updateNextRecordStepVisual();
-                 } else {
-                    clearStep(trackIndex, stepIndex);
-                 }
-            }
-        }
-
-        function handleNoteOn(note, velocity = 100) {
-            const activeTrackForPlayback = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
-
-            if (activeTrackForPlayback > -1) {
-                const track = tracks[activeTrackForPlayback];
-                if (!track.muteInternal && !track.channel.mute) track.source.triggerAttack(note, Tone.now(), velocity / 127);
-
-                if (armedTrackIndex > -1) {
-                    if (isPlaying && currentStep > -1) {
-                        recordNote(armedTrackIndex, currentStep, note, velocity, 0, 1);
-                    } else if (!isPlaying) {
-                        const recordStep = nonPlayStepIndices[armedTrackIndex];
-                        recordNote(armedTrackIndex, recordStep, note, velocity, 0, 1);
-                        updateNextRecordStepVisual();
-                    }
-                }
-            }
-            document.querySelector(`[data-note="${note}"]`)?.classList.add('pressed');
-            lastPressedNote = note;
-        }
-
-        function handleNoteOff(note) {
-            if (!note) return;
-            const activeTrackForPlayback = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
-            if (activeTrackForPlayback > -1) {
-                const track = tracks[activeTrackForPlayback];
-                if (typeof track.source.triggerRelease === 'function' && !track.muteInternal) {
-                    track.source.triggerRelease(note);
-                }
-            }
-            document.querySelector(`[data-note="${note}"]`)?.classList.remove('pressed');
-            if (lastPressedNote === note) {
-                lastPressedNote = null;
-            }
-        }
-
-        function recordNote(trackIndex, stepIndex, note, velocity, offset, ratchet) {
-            const stepData = stepGrid[trackIndex][stepIndex];
-            if (!stepData.some(n => n.note === note)) {
-                stepData.push({ note, velocity, offset, ratchet });
-                stepData.sort((a,b) => (noteNameToMidi(a.note) || 0) - (noteNameToMidi(b.note) || 0));
-                document.querySelector(`[data-track="${trackIndex}"][data-step="${stepIndex}"]`).classList.add('active');
-            }
-        }
-
-        function clearStep(trackIndex, stepIndex) {
-            stepGrid[trackIndex][stepIndex] = [];
-            document.querySelector(`[data-track="${trackIndex}"][data-step="${stepIndex}"]`).classList.remove('active');
-        }
-
-        // --- MIDI LOGIC ---
+        
+        // --- MIDI HANDLING ---
         function initializeMidi() {
             if (navigator.requestMIDIAccess) {
                 navigator.requestMIDIAccess({ sysex: true }).then(onMidiSuccess, e => console.error("MIDI Error:", e));
@@ -699,92 +636,85 @@
         }
 
         function onMidiSuccess(access) {
-            midiAccess = access;
-            midiInputs = Array.from(midiAccess.inputs.values());
-            midiOutputs = Array.from(midiAccess.outputs.values());
-            renderMidiSettings();
-
-            const oldClockVal = clockSourceSelect.value;
-            while (clockSourceSelect.options.length > 1) { clockSourceSelect.remove(1); }
-            midiInputs.forEach(input => {
+            state.midi.access = access;
+            state.midi.inputs = Array.from(state.midi.access.inputs.values());
+            state.midi.outputs = Array.from(state.midi.access.outputs.values());
+            
+            const oldClockVal = dom.clockSourceSelect.value;
+            while (dom.clockSourceSelect.options.length > 1) { dom.clockSourceSelect.remove(1); }
+            state.midi.inputs.forEach(input => {
                 const option = document.createElement('option');
-                option.value = input.id;
-                option.textContent = input.name;
-                clockSourceSelect.appendChild(option);
+                option.value = input.id; option.textContent = input.name;
+                dom.clockSourceSelect.appendChild(option);
             });
-            if (Array.from(clockSourceSelect.options).some(o => o.value === oldClockVal)) {
-                clockSourceSelect.value = oldClockVal;
+            if (Array.from(dom.clockSourceSelect.options).some(o => o.value === oldClockVal)) {
+                dom.clockSourceSelect.value = oldClockVal;
             }
 
-            midiAccess.inputs.forEach(input => input.onmidimessage = onMidiMessage);
-            access.onstatechange = () => initializeMidi();
+            state.midi.access.inputs.forEach(input => input.onmidimessage = onMidiMessage);
+            state.midi.access.onstatechange = () => initializeMidi();
         }
-
-        function handleClockSourceChange(event) {
-            currentClockSourceId = event.target.value;
-            if (currentClockSourceId === 'internal') {
-                tempoSlider.disabled = false;
-                Tone.Transport.bpm.value = tempoSlider.value;
-            } else {
-                tempoSlider.disabled = true;
-                lastClockTime = 0;
-                clockIntervals.length = 0;
-            }
-        }
-
+        
         function onMidiMessage(event) {
             const command = event.data[0];
-            if (event.target.id === currentClockSourceId && currentClockSourceId !== 'internal') {
-                if (command === 250) { togglePlayback(true); return; }
-                if (command === 252) { togglePlayback(false); return; }
-                if (command === 248) {
-                    const now = performance.now();
-                    if (lastClockTime > 0) {
-                        const interval = now - lastClockTime;
-                        clockIntervals.push(interval);
-                        if (clockIntervals.length > CLOCK_INTERVAL_BUFFER_SIZE) { clockIntervals.shift(); }
-                        const avgInterval = clockIntervals.reduce((a, b) => a + b, 0) / clockIntervals.length;
-                        const bpm = 60000 / (avgInterval * 24); 
+            const type = command & 0xF0;
 
-                        if (isFinite(bpm)) {
-                            Tone.Transport.bpm.value = bpm;
-                            tempoDisplay.textContent = Math.round(bpm);
+            // --- MIDI Clock Handling ---
+            if (event.target.id === state.midi.clockSourceId && state.midi.clockSourceId !== 'internal') {
+                switch(command) {
+                    case 250: // START
+                        state.midi.lastClockTime = 0;
+                        state.midi.clockIntervals.length = 0;
+                        togglePlayback(true); 
+                        return;
+                    case 252: // STOP
+                        togglePlayback(false); 
+                        state.midi.lastClockTime = 0;
+                        state.midi.clockIntervals.length = 0;
+                        dom.tempoDisplay.textContent = dom.tempoSlider.value;
+                        return;
+                    case 248: // CLOCK
+                        const now = performance.now();
+                        if (state.midi.lastClockTime > 0) {
+                            const interval = now - state.midi.lastClockTime;
+                            state.midi.clockIntervals.push(interval);
+                            if (state.midi.clockIntervals.length > CLOCK_INTERVAL_BUFFER_SIZE) { state.midi.clockIntervals.shift(); }
+                            const avgInterval = state.midi.clockIntervals.reduce((a, b) => a + b, 0) / state.midi.clockIntervals.length;
+                            const bpm = 60000 / (avgInterval * 24);
+                            if (isFinite(bpm) && bpm > 20 && bpm < 350) {
+                                 Tone.Transport.bpm.value = bpm;
+                                 dom.tempoDisplay.textContent = Math.round(bpm);
+                            }
                         }
+                        state.midi.lastClockTime = now;
+                        return;
+                }
+            }
+            
+            // --- MIDI Note & CC Handling ---
+            if (type !== 0x90 && type !== 0x80) return; // Ignore non-note messages
+            
+            const ch = (command & 0x0F) + 1;
+            const [_, noteNumber, velocity] = event.data;
+
+            state.tracks.forEach((track, trackIndex) => {
+                const isListening = (track.midiInPortId === 'none' || track.midiInPortId === event.target.id) && (track.midiInChan === 'all' || parseInt(track.midiInChan) === ch);
+                const isFeedbackLoop = track.midiOutPortId !== 'none' && track.midiOutPortId === event.target.id;
+                
+                if (isListening && !isFeedbackLoop) {
+                    const isArmedOrSelected = (state.armedTrackIndex === trackIndex) || (state.armedTrackIndex === -1 && state.selectedTrackIndex === trackIndex);
+                    if (isArmedOrSelected) {
+                         if (type === 0x90 && velocity > 0) handleNoteOn(midiToNoteName(noteNumber), velocity);
+                         else if (type === 0x80 || (type === 0x90 && velocity === 0)) handleNoteOff(midiToNoteName(noteNumber));
                     }
-                    lastClockTime = now;
-                    return;
                 }
-            }
-
-            const [noteCommand, noteNumber, velocity] = event.data;
-            const ch = (noteCommand & 0x0F) + 1;
-            const activeTrackIndex = (armedTrackIndex > -1) ? armedTrackIndex : selectedTrackIndex;
-
-            if (activeTrackIndex > -1) {
-                const activeTrack = tracks[activeTrackIndex];
-                if ((activeTrack.midiInPortId === 'none' || activeTrack.midiInPortId === event.target.id) && (activeTrack.midiInChan === 'all' || parseInt(activeTrack.midiInChan) === ch)) {
-                    if ((noteCommand & 0xF0) === 0x90 && velocity > 0) handleNoteOn(midiToNoteName(noteNumber), velocity);
-                    if ((noteCommand & 0xF0) === 0x80 || ((noteCommand & 0xF0) === 0x90 && velocity === 0)) handleNoteOff(midiToNoteName(noteNumber));
-                }
-            }
+            });
         }
-
-        function midiToNoteName(midi) {
-            return NOTE_NAMES[midi % 12] + (Math.floor(midi / 12) - 1);
-        }
-
-        function noteNameToMidi(note) {
-            const noteMap = { C: 0, "C#": 1, D: 2, "D#": 3, E: 4, F: 5, "F#": 6, G: 7, "G#": 8, A: 9, "A#": 10, B: 11 };
-            const match = note.match(/([A-G]#?)(-?\d+)/);
-            if (!match) return null;
-            const [, name, octave] = match;
-            return noteMap[name] + (parseInt(octave) + 1) * 12;
-        }
-
+        
         // --- MODAL & CONTROLS ---
         function openTrackSettingsModal(trackIndex) {
-            activeTrackIndexForModal = trackIndex;
-            const track = tracks[trackIndex];
+            state.activeModalTrackIndex = trackIndex;
+            const track = state.tracks[trackIndex];
             const modal = document.getElementById('track-settings-modal');
             modal.querySelector('#track-modal-title').textContent = `${track.name} Settings`;
             modal.querySelector('#track-volume').value = track.channel.volume.value;
@@ -821,67 +751,64 @@
         }
 
         function handleAlgorithmChange(newAlgo) {
-            if (activeTrackIndexForModal < 0) return;
-            const track = tracks[activeTrackIndexForModal];
+            if (state.activeModalTrackIndex < 0) return;
+            const track = state.tracks[state.activeModalTrackIndex];
             if (track.source) track.source.dispose();
-            track.source = createSynth(newAlgo).connect(track.phaser);
+            
+            const newParams = getDefaultSynthParams(newAlgo);
+            track.synthParams = newParams;
+            track.source = createSynth(newAlgo, newParams).connect(track.phaser);
             track.algorithm = newAlgo;
-            openTrackSettingsModal(activeTrackIndexForModal);
+
+            openTrackSettingsModal(state.activeModalTrackIndex);
         }
 
         function renderDynamicSynthParams(track) {
             const container = document.getElementById('dynamic-synth-params');
-            if (!container) return;
-            container.innerHTML = '';
-            const params = track.source.get();
+            if (!container || !track.synthParams) return;
+            
+            const params = track.synthParams;
+            const oscParams = params.oscillator;
+            const envParams = params.envelope;
+            const filterParams = params.filter;
+            const filterEnvParams = params.filterEnvelope;
 
-            const createSlider = (label, obj, prop, min, max, step) => {
-                const val = obj ? params[obj] ?.[prop] ?? 0 : params[prop] ?? 0;
-                const dataAttrs = obj ? `data-param-object="${obj}"` : '';
-                return `<div class="flex items-center"><label class="w-28 text-sm">${label}</label><input type="range" ${dataAttrs} data-param="${prop}" value="${val}" min="${min}" max="${max}" step="${step}" class="w-full instrument-control"></div>`;
+            const createSlider = (label, obj, objName, prop, min, max, step) => {
+                const val = obj[prop] ?? 0;
+                const dataAttrs = `data-param-object="${objName}" data-param="${prop}"`;
+                return `<div class="flex items-center"><label class="w-28 text-sm">${label}</label><input type="range" ${dataAttrs} value="${val}" min="${min}" max="${max}" step="${step}" class="w-full instrument-control"></div>`;
             }
+            
+            let html = `
+                <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Oscillator</h4>
+                ${createSlider('Detune', oscParams, 'oscillator', 'detune', 0, 100, 0.1)}
+                <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Amp Env</h4>
+                ${createSlider('Attack', envParams, 'envelope', 'attack', 0.001, 1, 0.001)}
+                ${createSlider('Decay', envParams, 'envelope', 'decay', 0.01, 2, 0.01)}
+                ${createSlider('Sustain', envParams, 'envelope', 'sustain', 0, 1, 0.01)}
+                ${createSlider('Release', envParams, 'envelope', 'release', 0.01, 4, 0.01)}
+            `;
 
-            switch (track.algorithm) {
-                case 'VA':
-                case 'Wavefolder':
-                    const osc = params.oscillator || {};
-                    const oscOptions = ['sine', 'square', 'sawtooth', 'triangle', 'fatsawtooth', 'pulse', 'pwm'].map(o => `<option value="${o}" ${o === osc.type ? 'selected' : ''}>${o}</option>`).join('');
-                    container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Oscillator</label><select data-param-object="oscillator" data-param="type" class="w-full bg-gray-600 rounded p-1 instrument-control">${oscOptions}</select></div>`;
-                    if (osc.type === 'pulse') container.innerHTML += createSlider('Pulse Width', 'oscillator', 'width', 0, 1, 0.01);
-                    if (osc.type === 'pwm') container.innerHTML += createSlider('PWM Freq', 'oscillator', 'modulationFrequency', 0.1, 20, 0.1);
-                    container.innerHTML += createSlider('Attack', 'envelope', 'attack', 0.001, 1, 0.001);
-                    container.innerHTML += createSlider('Decay', 'envelope', 'decay', 0.01, 2, 0.01);
-                    container.innerHTML += createSlider('Sustain', 'envelope', 'sustain', 0, 1, 0.01);
-                    container.innerHTML += createSlider('Release', 'envelope', 'release', 0.01, 4, 0.01);
-                    if (track.algorithm === 'Wavefolder' && track.source._shaper) {
-                        const driveVal = Math.log10((track.source._shaper.curve?.length || 4) / 4);
-                        container.innerHTML += `<div class="flex items-center"><label class="w-28 text-sm">Drive</label><input type="range" data-param-type="shaper" data-param="drive" value="${driveVal}" min="0" max="3" step="0.1" class="w-full instrument-control"></div>`;
-                    }
-                    break;
-                case 'FM':
-                    container.innerHTML += createSlider('Harmonicity', null, 'harmonicity', 0.1, 20, 0.1);
-                    container.innerHTML += createSlider('Mod Index', null, 'modulationIndex', 0, 100, 1);
-                    container.innerHTML += `<hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Carrier Env</h4>`;
-                    container.innerHTML += createSlider('Attack', 'envelope', 'attack', 0.001, 2, 0.001);
-                    container.innerHTML += createSlider('Decay', 'envelope', 'decay', 0.01, 2, 0.01);
-                    container.innerHTML += createSlider('Sustain', 'envelope', 'sustain', 0, 1, 0.01);
-                    container.innerHTML += createSlider('Release', 'envelope', 'release', 0.01, 4, 0.01);
-                    container.innerHTML += `<hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Modulator Env</h4>`;
-                    container.innerHTML += createSlider('Attack', 'modulationEnvelope', 'attack', 0.001, 2, 0.001);
-                    container.innerHTML += createSlider('Decay', 'modulationEnvelope', 'decay', 0.01, 2, 0.01);
-                    container.innerHTML += createSlider('Sustain', 'modulationEnvelope', 'sustain', 0, 1, 0.01);
-                    container.innerHTML += createSlider('Release', 'modulationEnvelope', 'release', 0.01, 4, 0.01);
-                    break;
-                case 'Pluck':
-                    container.innerHTML += createSlider('Attack Noise', null, 'attackNoise', 0.1, 10, 0.1);
-                    container.innerHTML += createSlider('Dampening', null, 'dampening', 500, 7000, 50);
-                    break;
+            if (filterParams && filterEnvParams) {
+                html += `
+                    <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Filter</h4>
+                    ${createSlider('Cutoff', filterParams, 'filter', 'frequency', 20, 20000, 1)}
+                    ${createSlider('Resonance', filterParams, 'filter', 'Q', 0.1, 10, 0.1)}
+                    <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Filter Env</h4>
+                    ${createSlider('Attack', filterEnvParams, 'filterEnvelope', 'attack', 0.001, 2, 0.001)}
+                    ${createSlider('Decay', filterEnvParams, 'filterEnvelope', 'decay', 0.01, 2, 0.01)}
+                    ${createSlider('Sustain', filterEnvParams, 'filterEnvelope', 'sustain', 0, 1, 0.01)}
+                    ${createSlider('Release', filterEnvParams, 'filterEnvelope', 'release', 0.01, 4, 0.01)}
+                    ${createSlider('Amount', filterEnvParams, 'filterEnvelope', 'octaves', 0, 8, 0.1)}
+                    ${createSlider('Base Freq', filterEnvParams, 'filterEnvelope', 'baseFrequency', 20, 5000, 1)}
+                `;
             }
+            container.innerHTML = html;
         }
 
         function handleTrackSettingsChange(e) {
-            if (activeTrackIndexForModal < 0) return;
-            const track = tracks[activeTrackIndexForModal];
+            if (state.activeModalTrackIndex < 0) return;
+            const track = state.tracks[state.activeModalTrackIndex];
             const el = e.target;
             const val = el.type === 'range' || el.type === 'select-one' ? el.value : null;
 
@@ -892,12 +819,7 @@
                 case 'track-delay': track.delay.wet.value = parseFloat(val); return;
                 case 'track-phaser': track.phaser.wet.value = parseFloat(val); return;
                 case 'mute-internal-btn': track.muteInternal = !track.muteInternal; el.textContent = track.muteInternal ? 'On' : 'Off'; el.classList.toggle('active', track.muteInternal); return;
-                
-                // Sampler Controls
-                case 'sampler-pitch':
-                    track.pitch = parseInt(val);
-                    document.getElementById('sampler-pitch-display').textContent = val;
-                    return;
+                case 'sampler-pitch': track.pitch = parseInt(val); document.getElementById('sampler-pitch-display').textContent = val; return;
                 case 'sampler-attack': track.source.attack = parseFloat(val); return;
                 case 'sampler-release': track.source.release = parseFloat(val); return;
                 case 'sampler-reverse-btn':
@@ -905,35 +827,26 @@
                     el.textContent = track.source.reverse ? 'On' : 'Off';
                     el.classList.toggle('active', track.source.reverse);
                     return;
-
-                // Synth Controls
                 case 'synth-algorithm': handleAlgorithmChange(val); return;
             }
 
             if (el.classList.contains('instrument-control')) {
-                let paramValue = el.type === 'range' ? parseFloat(el.value) : el.value;
-                const { param, paramObject, paramType } = el.dataset;
-                let settings = {};
-
-                if (paramType === 'shaper') {
-                    if (track.source._shaper) track.source._shaper.curve = new Float32Array(4096).map((_, i) => Math.tanh((i / 2048 - 1) * (10 ** paramValue)));
-                } else if (paramObject) {
-                    settings[paramObject] = { [param]: paramValue };
-                } else {
-                    settings[param] = paramValue;
-                }
-                track.source.set(settings);
-
-                if (param === 'type' && paramObject === 'oscillator') {
-                    renderDynamicSynthParams(track);
+                let paramValue = parseFloat(el.value);
+                const { param, paramObject } = el.dataset;
+                if(param && paramObject && track.synthParams[paramObject]) {
+                    // Update state object first
+                    track.synthParams[paramObject][param] = paramValue;
+                    // Then update the audio engine
+                    let settings = { [paramObject]: { [param]: paramValue } };
+                    track.source.set(settings);
                 }
             }
         }
 
         function openStepDetailModal(trackIndex, stepIndex) {
-            const stepData = stepGrid[trackIndex] ?.[stepIndex];
+            const stepData = state.stepGrid[trackIndex] ?.[stepIndex];
             if (!stepData || stepData.length === 0) return;
-            activeStepForModal = { track: trackIndex, step: stepIndex };
+            state.activeModalStep = { track: trackIndex, step: stepIndex };
             const firstNote = stepData[0];
             const modal = document.getElementById('step-detail-modal');
             modal.querySelector('#step-modal-title').textContent = `Track ${trackIndex+1}, Step ${stepIndex+1}`;
@@ -946,9 +859,9 @@
         }
 
         function handleStepDetailChange() {
-            if (!activeStepForModal) return;
-            const { track, step } = activeStepForModal;
-            const stepData = stepGrid[track] ?.[step];
+            if (!state.activeModalStep) return;
+            const { track, step } = state.activeModalStep;
+            const stepData = state.stepGrid[track] ?.[step];
             if (!stepData || stepData.length === 0) return;
             const modal = document.getElementById('step-detail-modal');
             const newVelocity = parseInt(modal.querySelector('#step-velocity').value);
@@ -966,20 +879,25 @@
         function renderMidiSettings() {
             const container = document.getElementById('midi-track-settings');
             if (!container) return;
-            const header = `<div class="hidden md:grid grid-cols-5 gap-x-4 gap-y-2 text-sm font-bold text-gray-400 border-b border-gray-600 pb-2 mb-2"><span>Track</span><span>Input</span><span>In Ch</span><span>Output</span><span>Out Ch</span></div>`;
-            const inputOptions = `<option value="none">None</option>` + midiInputs.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
-            const outputOptions = `<option value="none">None</option>` + midiOutputs.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
+            const header = `<div class="hidden md:grid grid-cols-5 gap-x-4 gap-y-2 text-sm font-bold text-gray-400 border-b border-gray-600 pb-2 mb-2">
+                <span>Track</span><span>Input Device</span><span>In Ch</span><span>Output Device</span><span>Out Ch</span>
+            </div>`;
+            const inputOptions = `<option value="none">None</option>` + state.midi.inputs.map(i => `<option value="${i.id}">${i.name}</option>`).join('');
+            const outputOptions = `<option value="none">None</option>` + state.midi.outputs.map(o => `<option value="${o.id}">${o.name}</option>`).join('');
             const channels = Array.from({ length: 16 }, (_, i) => `<option value="${i+1}">${i+1}</option>`).join('');
-            const trackRows = tracks.map((track, index) => `
-                <div class="grid grid-cols-1 md:grid-cols-5 gap-x-4 gap-y-2 items-center border-b border-gray-700 py-2">
-                    <div class="font-medium text-gray-300 truncate"><span class="md:hidden font-bold">Track: </span>${track.name}</div>
-                    <select data-track-index="${index}" data-type="in-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${inputOptions}</select>
-                    <select data-track-index="${index}" data-type="in-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm"><option value="all">All</option>${channels}</select>
-                    <select data-track-index="${index}" data-type="out-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${outputOptions}</select>
-                    <select data-track-index="${index}" data-type="out-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm">${channels}</select>
-                </div>`).join('');
+            
+            const trackRows = state.tracks.map((track, index) => `
+                <div class="space-y-2 md:space-y-0 md:grid md:grid-cols-5 md:gap-x-4 items-center border-b border-gray-700 py-2">
+                    <div class="font-medium text-gray-300 truncate"><span class="md:hidden font-bold text-gray-400">Track: </span>${track.name}</div>
+                     <div><label for="midi-in-port-${index}" class="text-sm font-medium text-gray-400 md:hidden">Input Device</label><select id="midi-in-port-${index}" data-track-index="${index}" data-type="in-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm mt-1 md:mt-0">${inputOptions}</select></div>
+                    <div><label for="midi-in-chan-${index}" class="text-sm font-medium text-gray-400 md:hidden">Input Channel</label><select id="midi-in-chan-${index}" data-track-index="${index}" data-type="in-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm mt-1 md:mt-0"><option value="all">All</option>${channels}</select></div>
+                    <div><label for="midi-out-port-${index}" class="text-sm font-medium text-gray-400 md:hidden">Output Device</label><select id="midi-out-port-${index}" data-track-index="${index}" data-type="out-port" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm mt-1 md:mt-0">${outputOptions}</select></div>
+                    <div><label for="midi-out-chan-${index}" class="text-sm font-medium text-gray-400 md:hidden">Output Channel</label><select id="midi-out-chan-${index}" data-track-index="${index}" data-type="out-chan" class="midi-config-select w-full bg-gray-600 rounded p-1 text-sm mt-1 md:mt-0">${channels}</select></div>
+                </div>
+            `).join('');
+
             container.innerHTML = header + trackRows;
-            tracks.forEach((track, index) => {
+            state.tracks.forEach((track, index) => {
                 container.querySelector(`[data-track-index="${index}"][data-type="in-port"]`).value = track.midiInPortId;
                 container.querySelector(`[data-track-index="${index}"][data-type="in-chan"]`).value = track.midiInChan;
                 container.querySelector(`[data-track-index="${index}"][data-type="out-port"]`).value = track.midiOutPortId;
@@ -987,54 +905,92 @@
             });
         }
 
-        // --- EVENT LISTENERS ---
+        // --- EVENT LISTENERS INITIALIZATION ---
         function initializeEventListeners() {
-            if (listenersInitialized) return;
+            if (state.listenersInitialized) return;
 
-            playStopBtn.addEventListener('click', () => togglePlayback());
-            tempoSlider.addEventListener('input', (e) => { 
-                if (currentClockSourceId === 'internal') {
+            dom.playStopBtn.addEventListener('click', () => togglePlayback());
+            dom.tempoSlider.addEventListener('input', e => { 
+                if (state.midi.clockSourceId === 'internal') {
                     Tone.Transport.bpm.value = e.target.value; 
-                    tempoDisplay.textContent = e.target.value;
+                    dom.tempoDisplay.textContent = e.target.value;
                 }
             });
-            addTrackBtn.addEventListener('click', addTrack);
-            removeTrackBtn.addEventListener('click', removeLastTrack);
-            document.getElementById('midi-settings-btn').addEventListener('click', () => {
+            dom.addTrackBtn.addEventListener('click', addTrack);
+            dom.removeTrackBtn.addEventListener('click', removeLastTrack);
+            dom.midiSettingsBtn.addEventListener('click', () => {
+                renderMidiSettings();
                 document.getElementById('midi-modal')?.classList.remove('hidden');
             });
+            dom.clockSourceSelect.addEventListener('change', e => {
+                state.midi.clockSourceId = e.target.value;
+                if (state.midi.clockSourceId === 'internal') {
+                    dom.tempoSlider.disabled = false;
+                    Tone.Transport.bpm.value = dom.tempoSlider.value;
+                } else {
+                    dom.tempoSlider.disabled = true;
+                    state.midi.lastClockTime = 0;
+                    state.midi.clockIntervals.length = 0;
+                }
+            });
 
-            noteInputGridContainer.addEventListener('mousedown', e => {
+            dom.noteInputGrid.addEventListener('mousedown', e => {
                 if (e.target.matches('.note-input-btn')) {
                     e.preventDefault();
                     handleNoteOn(e.target.dataset.note);
+                    state.lastPressedNote = e.target.dataset.note;
                 }
             });
-            window.addEventListener('mouseup', () => handleNoteOff(lastPressedNote));
-            window.addEventListener('mouseleave', () => handleNoteOff(lastPressedNote));
+            window.addEventListener('mouseup', () => handleNoteOff(state.lastPressedNote));
+            window.addEventListener('mouseleave', () => handleNoteOff(state.lastPressedNote));
 
-            modalsContainer.addEventListener('click', e => {
+            dom.gridContainer.addEventListener('click', e => {
+                const target = e.target;
+                const action = target.dataset.action;
+                if (!action) return;
+                
+                const trackRow = target.closest('.track-row');
+                if (!trackRow) return;
+                const trackIndex = parseInt(trackRow.dataset.trackIndex);
+
+                switch (action) {
+                    case 'select-track': selectTrack(trackIndex); break;
+                    case 'arm-track': armTrack(trackIndex); break;
+                    case 'toggle-mute': toggleMute(trackIndex); break;
+                    case 'toggle-solo': toggleSolo(trackIndex); break;
+                    case 'open-track-settings': openTrackSettingsModal(trackIndex); break;
+                    case 'load-sample': trackRow.querySelector('[data-action="load-sample-input"]').click(); break;
+                    case 'clear-sample': clearSample(trackIndex); break;
+                    case 'handle-step-click':
+                        const stepIndex = parseInt(target.dataset.step);
+                        handleStepClick(trackIndex, stepIndex, e);
+                        break;
+                }
+            });
+             dom.gridContainer.addEventListener('dblclick', e => {
+                const target = e.target;
+                if(target.dataset.dblaction === 'open-step-detail') {
+                     const trackRow = target.closest('.track-row');
+                     const trackIndex = parseInt(trackRow.dataset.trackIndex);
+                     const stepIndex = parseInt(target.dataset.step);
+                     openStepDetailModal(trackIndex, stepIndex);
+                }
+            });
+
+            dom.modalsContainer.addEventListener('click', e => {
                 const el = e.target;
-                if (el.matches('.close-modal-btn')) {
-                    el.closest('.modal').classList.add('hidden');
-                } else if (el.closest('#track-settings-modal') && el.matches('button')) {
-                    handleTrackSettingsChange(e);
-                }
+                if (el.matches('.close-modal-btn')) el.closest('.modal').classList.add('hidden');
+                else if (el.closest('#track-settings-modal') && el.matches('button')) handleTrackSettingsChange(e);
             });
-
-            modalsContainer.addEventListener('input', e => {
+            dom.modalsContainer.addEventListener('input', e => {
                 const modal = e.target.closest('.modal');
                 if (!modal) return;
-                switch (modal.id) {
-                    case 'step-detail-modal': handleStepDetailChange(); break;
-                    case 'track-settings-modal': handleTrackSettingsChange(e); break;
-                }
+                if (modal.id === 'step-detail-modal' || modal.id === 'track-settings-modal') handleTrackSettingsChange(e);
             });
-
-            modalsContainer.addEventListener('change', e => {
+            dom.modalsContainer.addEventListener('change', e => {
                  if (e.target.matches('.midi-config-select')) {
                     const { trackIndex, type } = e.target.dataset;
-                    const track = tracks[parseInt(trackIndex)];
+                    const track = state.tracks[parseInt(trackIndex)];
                     if(!track) return;
                     switch (type) {
                         case 'in-port': track.midiInPortId = e.target.value; break;
@@ -1044,24 +1000,33 @@
                     }
                 }
             });
+
+            window.addEventListener('resize', () => {
+                const newNumSteps = window.innerWidth >= LARGE_SCREEN_BREAKPOINT ? 32 : 16;
+                if (newNumSteps !== NUM_STEPS) {
+                    NUM_STEPS = newNumSteps;
+                    sequenceLoop.cancel();
+                    sequenceLoop.events = Array.from({length: NUM_STEPS}, (_,i) => i);
+                    sequenceLoop.start(0);
+                    renderGrid();
+                }
+            });
             
-            listenersInitialized = true;
+            state.listenersInitialized = true;
         }
 
         // --- STARTUP ---
         function main() {
-            clockSourceSelect = document.getElementById('clock-source-select');
-            clockSourceSelect.addEventListener('change', handleClockSourceChange);
             for (let i = 0; i < 4; i++) {
-                tracks.push(createNewTrack(i));
-                stepGrid.push(Array.from({ length: NUM_STEPS }, () => []));
-                nonPlayStepIndices.push(0);
+                state.tracks.push(createNewTrack(i));
+                state.stepGrid.push(Array.from({ length: 32 }, () => [])); // Initialize with max steps
+                state.nonPlayStepIndices.push(0);
             }
             renderAll();
             initializeEventListeners();
             initializeMidi();
         }
-
+        
         main();
     </script>
 </body>

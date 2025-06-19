@@ -142,8 +142,7 @@
 
     <script type="module">
         // --- CONSTANTS ---
-        let NUM_STEPS = 16;
-        const LARGE_SCREEN_BREAKPOINT = 1024;
+        const NUM_STEPS = 16;
         const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
         const NOTE_INPUT_OCTAVES = 7;
         const NOTE_INPUT_START_OCTAVE = 1;
@@ -272,6 +271,15 @@
         
         function renderModals() {
             dom.modalsContainer.innerHTML = `
+                <!-- MIDI Permission Modal -->
+                <div id="midi-permission-modal" class="modal fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center hidden p-4 z-50">
+                    <div class="bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-md border border-gray-700 space-y-4">
+                        <h2 class="text-2xl font-bold text-yellow-400">MIDI Permission Required</h2>
+                        <p class="text-gray-300">To use MIDI devices, please grant this site permission to access them. This is a browser security feature.</p>
+                        <p class="text-gray-400 text-sm">Look for a permission prompt in your browser's address bar. You may need to reload the page after granting permission.</p>
+                        <div class="text-right"><button class="close-modal-btn bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg">OK</button></div>
+                    </div>
+                </div>
                 <!-- Track Settings Modal -->
                 <div id="track-settings-modal" class="modal fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center hidden p-4 z-50">
                     <div class="bg-gray-800 rounded-lg shadow-xl p-6 w-full max-w-lg border border-gray-700 space-y-4 max-h-[90vh] modal-scroll-content overflow-y-auto">
@@ -477,7 +485,7 @@
                 state.armedTrackIndex = trackIndex;
                 if(state.selectedTrackIndex !== trackIndex) selectTrack(trackIndex);
             }
-            renderGrid(); // Re-render to show/hide playhead controls
+            renderGrid(); 
             updateNextRecordStepVisual();
         }
 
@@ -700,12 +708,27 @@
         // --- MIDI HANDLING ---
         function initializeMidi() {
             if (navigator.requestMIDIAccess) {
-                navigator.requestMIDIAccess({ sysex: true }).then(onMidiSuccess, e => console.error("MIDI Error:", e));
+                navigator.requestMIDIAccess({ sysex: true })
+                .then(onMidiSuccess)
+                .catch(e => {
+                    console.error("MIDI Error:", e);
+                    const modal = document.getElementById('midi-permission-modal');
+                    if (modal) modal.classList.remove('hidden');
+                });
+            } else {
+                console.warn("Web MIDI API is not supported in this browser.");
             }
         }
 
         function onMidiSuccess(access) {
             state.midi.access = access;
+            updateMidiDeviceLists();
+            state.midi.access.onstatechange = () => updateMidiDeviceLists();
+        }
+        
+        function updateMidiDeviceLists() {
+            if (!state.midi.access) return;
+
             state.midi.inputs = Array.from(state.midi.access.inputs.values());
             state.midi.outputs = Array.from(state.midi.access.outputs.values());
             
@@ -716,12 +739,32 @@
                 option.value = input.id; option.textContent = input.name;
                 dom.clockSourceSelect.appendChild(option);
             });
-            if (Array.from(dom.clockSourceSelect.options).some(o => o.value === oldClockVal)) {
+
+            if (state.midi.inputs.some(i => i.id === oldClockVal)) {
                 dom.clockSourceSelect.value = oldClockVal;
+            } else {
+                dom.clockSourceSelect.value = 'internal';
+                handleClockSourceChange();
+            }
+            
+            const midiModal = document.getElementById('midi-modal');
+            if (midiModal && !midiModal.classList.contains('hidden')) {
+                renderMidiSettings();
             }
 
             state.midi.access.inputs.forEach(input => input.onmidimessage = onMidiMessage);
-            state.midi.access.onstatechange = () => initializeMidi();
+        }
+        
+        function handleClockSourceChange() {
+            state.midi.clockSourceId = dom.clockSourceSelect.value;
+            if (state.midi.clockSourceId === 'internal') {
+                dom.tempoSlider.disabled = false;
+                Tone.Transport.bpm.value = dom.tempoSlider.value;
+            } else {
+                dom.tempoSlider.disabled = true;
+                state.midi.lastClockTime = 0;
+                state.midi.clockIntervals.length = 0;
+            }
         }
         
         function onMidiMessage(event) {
@@ -994,18 +1037,8 @@
                 renderMidiSettings();
                 document.getElementById('midi-modal')?.classList.remove('hidden');
             });
-            dom.clockSourceSelect.addEventListener('change', e => {
-                state.midi.clockSourceId = e.target.value;
-                if (state.midi.clockSourceId === 'internal') {
-                    dom.tempoSlider.disabled = false;
-                    Tone.Transport.bpm.value = dom.tempoSlider.value;
-                } else {
-                    dom.tempoSlider.disabled = true;
-                    state.midi.lastClockTime = 0;
-                    state.midi.clockIntervals.length = 0;
-                }
-            });
-
+            dom.clockSourceSelect.addEventListener('change', handleClockSourceChange);
+            
             dom.noteInputGrid.addEventListener('mousedown', e => {
                 if (e.target.matches('.note-input-btn')) {
                     e.preventDefault();

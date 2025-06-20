@@ -121,12 +121,6 @@
             </div>
         </header>
         
-        <div id="playhead-controls" class="flex-shrink-0 w-full flex justify-center items-center gap-4 py-1 hidden">
-             <button id="playhead-left-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&larr;</button>
-             <span class="text-xs text-gray-400">STEP RECORD</span>
-             <button id="playhead-right-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&rarr;</button>
-        </div>
-
         <div id="note-input-scroll-wrapper" class="flex-shrink-0 w-full overflow-x-auto bg-gray-700 rounded-lg p-2">
              <div id="note-input-grid" class="h-20 grid grid-rows-2 grid-flow-col gap-1" style="min-width: 105rem;"></div>
         </div>
@@ -166,7 +160,6 @@
             removeTrackBtn: document.getElementById('remove-track-btn'),
             midiSettingsBtn: document.getElementById('midi-settings-btn'),
             clockSourceSelect: document.getElementById('clock-source-select'),
-            playheadControls: document.getElementById('playhead-controls'),
         };
 
         // --- APPLICATION STATE ---

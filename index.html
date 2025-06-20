@@ -618,11 +618,16 @@
             });
         }
         function clearSample(trackIndex) {
-            if (state.tracks[trackIndex].type !== 'Sampler') return;
-            if (state.tracks[trackIndex].source) state.tracks[trackIndex].source.dispose();
-            state.tracks[trackIndex].source = createSynth().connect(state.tracks[trackIndex].phaser);
-            state.tracks[trackIndex].name = `Track ${trackIndex + 1}`;
-            delete state.tracks[trackIndex].pitch; // remove pitch property
+            const track = state.tracks[trackIndex];
+            if (track.type !== 'Sampler') return;
+            if (track.source) track.source.dispose();
+            
+            const newParams = getDefaultSynthParams('VA');
+            track.source = createSynth('VA', newParams).connect(track.phaser);
+            track.name = `Track ${trackIndex + 1}`;
+            track.type = 'Synth';
+            track.synthParams = newParams;
+            delete track.pitch;
             renderGrid();
         }
 
@@ -1124,7 +1129,7 @@
                         case 'out-port': track.midiOutPortId = e.target.value; break;
                         case 'out-chan': track.midiOutChan = e.target.value; break;
                     }
-                } else if(e.target.matches('#synth-algorithm') || (e.target.matches('.instrument-control[data-param="type"]'))) {
+                } else if(e.target.matches('#synth-algorithm') || (e.target.matches('.instrument-control') && e.target.dataset.param === 'type')) {
                     handleTrackSettingsChange(e);
                 }
             });

@@ -121,6 +121,12 @@
             </div>
         </header>
         
+        <div id="playhead-controls" class="flex-shrink-0 w-full flex justify-center items-center gap-4 py-1 hidden">
+             <button id="playhead-left-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&larr;</button>
+             <span class="text-xs text-gray-400">STEP RECORD</span>
+             <button id="playhead-right-btn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-1 px-3 rounded-lg text-lg">&rarr;</button>
+        </div>
+
         <div id="note-input-scroll-wrapper" class="flex-shrink-0 w-full overflow-x-auto bg-gray-700 rounded-lg p-2">
              <div id="note-input-grid" class="h-20 grid grid-rows-2 grid-flow-col gap-1" style="min-width: 105rem;"></div>
         </div>
@@ -160,6 +166,7 @@
             removeTrackBtn: document.getElementById('remove-track-btn'),
             midiSettingsBtn: document.getElementById('midi-settings-btn'),
             clockSourceSelect: document.getElementById('clock-source-select'),
+            playheadControls: document.getElementById('playhead-controls'),
         };
 
         // --- APPLICATION STATE ---
@@ -903,6 +910,7 @@
             if (filterParams && filterEnvParams) {
                 html += `
                     <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Filter</h4>
+                    <div class="flex items-center"><label class="w-28 text-sm">Type</label><select data-param-object="filter" data-param="type" class="w-full bg-gray-600 rounded p-1 instrument-control">${['lowpass', 'highpass', 'bandpass'].map(o => `<option value="${o}" ${o === filterParams.type ? 'selected' : ''}>${o}</option>`).join('')}</select></div>
                     ${createSlider('Cutoff', filterParams, 'filter', 'frequency', 20, 20000, 1)}
                     ${createSlider('Resonance', filterParams, 'filter', 'Q', 0.1, 10, 0.1)}
                     <hr class="border-gray-600 my-2"><h4 class="text-sm font-semibold text-gray-400">Filter Env</h4>
